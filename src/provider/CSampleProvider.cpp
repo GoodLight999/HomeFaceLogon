@@ -24,10 +24,12 @@ CSampleProvider::CSampleProvider():
     _pCredProviderUserArray(nullptr)
 {
     DllAddRef();
+    LogInfo(L"CSampleProvider constructor called.");
 }
 
 CSampleProvider::~CSampleProvider()
 {
+    LogInfo(L"CSampleProvider destructor called.");
     if (_pCredential != nullptr)
     {
         _pCredential->Release();
@@ -48,6 +50,7 @@ HRESULT CSampleProvider::SetUsageScenario(
     CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     DWORD /*dwFlags*/)
 {
+    LogInfo(L"SetUsageScenario called: cpus=%d", cpus);
     HRESULT hr;
 
     // Decide which scenarios to support here. Returning E_NOTIMPL simply tells the caller

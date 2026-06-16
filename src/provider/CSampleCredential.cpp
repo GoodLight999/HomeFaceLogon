@@ -616,7 +616,7 @@ struct REPORT_RESULT_STATUS_INFO
 
 static const REPORT_RESULT_STATUS_INFO s_rgLogonStatusInfo[] =
 {
-    { STATUS_LOGON_FAILURE, STATUS_SUCCESS, L"Incorrect password or username.", CPSI_ERROR, },
+    { STATUS_LOGON_FAILURE, STATUS_SUCCESS, L"保存済みパスワードが無効です。標準のサインイン方法でログイン後、Face Logon設定を更新してください。", CPSI_ERROR, },
     { STATUS_ACCOUNT_RESTRICTION, STATUS_ACCOUNT_DISABLED, L"The account is disabled.", CPSI_WARNING },
 };
 
@@ -629,6 +629,7 @@ HRESULT CSampleCredential::ReportResult(NTSTATUS ntsStatus,
                                         _Outptr_result_maybenull_ PWSTR *ppwszOptionalStatusText,
                                         _Out_ CREDENTIAL_PROVIDER_STATUS_ICON *pcpsiOptionalStatusIcon)
 {
+    LogInfo(L"ReportResult: ntsStatus=0x%08X, ntsSubstatus=0x%08X", ntsStatus, ntsSubstatus);
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
 
