@@ -27,6 +27,14 @@ if (-not (Test-Path $dllSource)) {
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -Path $dllSource -Destination (Join-Path $installDir "FaceLogonProvider.dll") -Force
 
+$exeSource = Join-Path $PSScriptRoot "..\x64\Release\FaceLogonSetup.exe"
+if (-not (Test-Path $exeSource)) {
+    $exeSource = Join-Path $PSScriptRoot "..\x64\Debug\FaceLogonSetup.exe"
+}
+if (Test-Path $exeSource) {
+    Copy-Item -Path $exeSource -Destination (Join-Path $installDir "FaceLogonSetup.exe") -Force
+}
+
 # 3. Create settings and logs directories
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dataDir "logs") -Force | Out-Null
