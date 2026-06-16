@@ -23,22 +23,38 @@ if (-not (Test-Path $dllSource)) {
     exit 1
 }
 
-# 2. Copy binaries
+# 2. Copy binaries and dependent DLLs
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -Path $dllSource -Destination (Join-Path $installDir "FaceLogonProvider.dll") -Force
 
 $exeSource = Join-Path $PSScriptRoot "..\x64\Release\FaceLogonSetup.exe"
+$config = "Release"
 if (-not (Test-Path $exeSource)) {
     $exeSource = Join-Path $PSScriptRoot "..\x64\Debug\FaceLogonSetup.exe"
+    $config = "Debug"
 }
 if (Test-Path $exeSource) {
     Copy-Item -Path $exeSource -Destination (Join-Path $installDir "FaceLogonSetup.exe") -Force
+    # Copy OpenCV DLLs based on build config
+    $binDir = Join-Path $PSScriptRoot "..\x64\$config"
+    Get-ChildItem -Path $binDir -Filter "*.dll" | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $installDir -Force
+    }
 }
 
 # 3. Create settings and logs directories
+$modelsDstDir = Join-Path $dataDir "models"
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dataDir "logs") -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $dataDir "models") -Force | Out-Null
+New-Item -ItemType Directory -Path $modelsDstDir -Force | Out-Null
+
+# Copy ONNX models to ProgramData
+$modelsSrcDir = Join-Path $PSScriptRoot "..\models"
+if (Test-Path $modelsSrcDir) {
+    Get-ChildItem -Path $modelsSrcDir -Filter "*.onnx" | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $modelsDstDir -Force
+    }
+}
 
 # 4. Set directory ACL
 $acl = Get-Acl -Path $dataDir
