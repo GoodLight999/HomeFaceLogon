@@ -6,6 +6,7 @@
 #include <strsafe.h>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 static std::wstring ExtractStringField(const std::string& content, const std::string& fieldName)
 {
@@ -79,3 +80,86 @@ bool LoadAppConfig(AppConfig* config)
 
     return true;
 }
+
+#pragma comment(lib, "Crypt32.lib")
+
+struct SecretFileHeader {
+    uint32_t magic;          // 'HFLO' (0x4F4C4648)
+    uint16_t schemaVersion;  // 1
+    uint16_t flags;          // 0
+    uint32_t protectedBlobSize;
+};
+
+const uint32_t HFLO_MAGIC = 0x4F4C4648;
+
+bool LoadAndDecryptPassword(PWSTR* ppszPassword)
+{
+    if (ppszPassword == nullptr) return false;
+    *ppszPassword = nullptr;
+
+    wchar_t path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    {
+        return false;
+    }
+    PathAppendW(path, L"HomeFaceLogon");
+    PathAppendW(path, L"secret.bin");
+
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file.is_open())
+    {
+        return false;
+    }
+
+    SecretFileHeader header;
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (file.gcount() != sizeof(header) || header.magic != HFLO_MAGIC || header.schemaVersion != 1)
+    {
+        file.close();
+        return false;
+    }
+
+    std::vector<char> encryptedBlob(header.protectedBlobSize);
+    file.read(encryptedBlob.data(), header.protectedBlobSize);
+    if (file.gcount() != header.protectedBlobSize)
+    {
+        file.close();
+        return false;
+    }
+    file.close();
+
+    DATA_BLOB input;
+    input.pbData = reinterpret_cast<BYTE*>(encryptedBlob.data());
+    input.cbData = header.protectedBlobSize;
+
+    DATA_BLOB output = {0};
+    if (!CryptUnprotectData(
+        &input,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        &output
+    ))
+    {
+        return false;
+    }
+
+    PWSTR pszPassword = static_cast<PWSTR>(CoTaskMemAlloc(output.cbData));
+    if (pszPassword == nullptr)
+    {
+        SecureZeroMemory(output.pbData, output.cbData);
+        LocalFree(output.pbData);
+        return false;
+    }
+
+    CopyMemory(pszPassword, output.pbData, output.cbData);
+    
+    SecureZeroMemory(output.pbData, output.cbData);
+    LocalFree(output.pbData);
+
+    *ppszPassword = pszPassword;
+    return true;
+}
+

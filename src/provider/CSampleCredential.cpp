@@ -15,6 +15,8 @@
 #include <unknwn.h>
 #include "CSampleCredential.h"
 #include "guid.h"
+#include "log.h"
+#include "config.h"
 
 CSampleCredential::CSampleCredential():
     _cRef(1),
@@ -510,12 +512,17 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
     *pcpsiOptionalStatusIcon = CPSI_NONE;
     ZeroMemory(pcpcs, sizeof(*pcpcs));
 
-    // For local user, the domain and user name can be split from _pszQualifiedUserName (domain\username).
-    // CredPackAuthenticationBuffer() cannot be used because it won't work with unlock scenario.
+    PWSTR pwzDecryptedPassword = nullptr;
+    if (!LoadAndDecryptPassword(&pwzDecryptedPassword))
+    {
+        LogError(L"GetSerialization failed: Could not load or decrypt password from secret.bin");
+        return E_FAIL;
+    }
+
     if (_fIsLocalUser)
     {
         PWSTR pwzProtectedPassword;
-        hr = ProtectIfNecessaryAndCopyPassword(_rgFieldStrings[SFI_PASSWORD], _cpus, &pwzProtectedPassword);
+        hr = ProtectIfNecessaryAndCopyPassword(pwzDecryptedPassword, _cpus, &pwzProtectedPassword);
         if (SUCCEEDED(hr))
         {
             PWSTR pszDomain;
@@ -527,9 +534,6 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                 hr = KerbInteractiveUnlockLogonInit(pszDomain, pszUsername, pwzProtectedPassword, _cpus, &kiul);
                 if (SUCCEEDED(hr))
                 {
-                    // We use KERB_INTERACTIVE_UNLOCK_LOGON in both unlock and logon scenarios.  It contains a
-                    // KERB_INTERACTIVE_LOGON to hold the creds plus a LUID that is filled in for us by Winlogon
-                    // as necessary.
                     hr = KerbInteractiveUnlockLogonPack(kiul, &pcpcs->rgbSerialization, &pcpcs->cbSerialization);
                     if (SUCCEEDED(hr))
                     {
@@ -539,10 +543,6 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                         {
                             pcpcs->ulAuthenticationPackage = ulAuthPackage;
                             pcpcs->clsidCredentialProvider = CLSID_CSample;
-                            // At this point the credential has created the serialized credential used for logon
-                            // By setting this to CPGSR_RETURN_CREDENTIAL_FINISHED we are letting logonUI know
-                            // that we have all the information we need and it should attempt to submit the
-                            // serialized credential.
                             *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
                         }
                     }
@@ -557,8 +557,7 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
     {
         DWORD dwAuthFlags = CRED_PACK_PROTECTED_CREDENTIALS | CRED_PACK_ID_PROVIDER_CREDENTIALS;
 
-        // First get the size of the authentication buffer to allocate
-        if (!CredPackAuthenticationBuffer(dwAuthFlags, _pszQualifiedUserName, const_cast<PWSTR>(_rgFieldStrings[SFI_PASSWORD]), nullptr, &pcpcs->cbSerialization) &&
+        if (!CredPackAuthenticationBuffer(dwAuthFlags, _pszQualifiedUserName, pwzDecryptedPassword, nullptr, &pcpcs->cbSerialization) &&
             (GetLastError() == ERROR_INSUFFICIENT_BUFFER))
         {
             pcpcs->rgbSerialization = static_cast<byte *>(CoTaskMemAlloc(pcpcs->cbSerialization));
@@ -566,8 +565,7 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
             {
                 hr = S_OK;
 
-                // Retrieve the authentication buffer
-                if (CredPackAuthenticationBuffer(dwAuthFlags, _pszQualifiedUserName, const_cast<PWSTR>(_rgFieldStrings[SFI_PASSWORD]), pcpcs->rgbSerialization, &pcpcs->cbSerialization))
+                if (CredPackAuthenticationBuffer(dwAuthFlags, _pszQualifiedUserName, pwzDecryptedPassword, pcpcs->rgbSerialization, &pcpcs->cbSerialization))
                 {
                     ULONG ulAuthPackage;
                     hr = RetrieveNegotiateAuthPackage(&ulAuthPackage);
@@ -575,26 +573,16 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                     {
                         pcpcs->ulAuthenticationPackage = ulAuthPackage;
                         pcpcs->clsidCredentialProvider = CLSID_CSample;
-
-                        // At this point the credential has created the serialized credential used for logon
-                        // By setting this to CPGSR_RETURN_CREDENTIAL_FINISHED we are letting logonUI know
-                        // that we have all the information we need and it should attempt to submit the
-                        // serialized credential.
                         *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
                     }
                 }
                 else
                 {
                     hr = HRESULT_FROM_WIN32(GetLastError());
-                    if (SUCCEEDED(hr))
-                    {
-                        hr = E_FAIL;
-                    }
-                }
-
-                if (FAILED(hr))
-                {
+                    LogError(L"CredPackAuthenticationBuffer failed: HRESULT=0x%08X", hr);
                     CoTaskMemFree(pcpcs->rgbSerialization);
+                    pcpcs->rgbSerialization = nullptr;
+                    pcpcs->cbSerialization = 0;
                 }
             }
             else
@@ -602,7 +590,19 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                 hr = E_OUTOFMEMORY;
             }
         }
+        else
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            LogError(L"CredPackAuthenticationBuffer size query failed: HRESULT=0x%08X", hr);
+        }
     }
+
+    if (pwzDecryptedPassword != nullptr)
+    {
+        SecureZeroMemory(pwzDecryptedPassword, wcslen(pwzDecryptedPassword) * sizeof(wchar_t));
+        CoTaskMemFree(pwzDecryptedPassword);
+    }
+
     return hr;
 }
 
