@@ -1,0 +1,182 @@
+# Home Face Logon
+# Public repository: never commit machine-specific credentials, face data,
+# diagnostic artifacts, signing keys, or runtime state.
+
+# ----------------------------------------------------------------------
+# Visual Studio / MSBuild / CMake
+# ----------------------------------------------------------------------
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+ipch/
+.cache/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+cmake-build-*/
+[Bb]uild/
+[Oo]ut/
+[Bb]in/
+[Oo]bj/
+x64/
+x86/
+ARM/
+ARM64/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+packages/
+vcpkg_installed/
+.nuget/
+
+# Compiled binaries and symbols
+*.obj
+*.o
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.msi
+*.msix
+*.appx
+*.cab
+
+# ----------------------------------------------------------------------
+# Local/private workspace directories
+# ----------------------------------------------------------------------
+/local/
+/private/
+/secrets/
+/runtime-data/
+/diagnostics/
+/logs/
+/captures/
+/screenshots/
+/test-results/
+/artifacts/
+/sandbox/
+/agy-work/
+/.agent-local/
+
+# ----------------------------------------------------------------------
+# Runtime credentials, face templates, and machine-specific configuration
+# ----------------------------------------------------------------------
+**/secret.bin
+**/face.bin
+**/*.dpapi
+**/*.credential
+**/*.credentials
+**/*.face-template
+**/*.embedding
+**/*.embeddings
+**/config.local.json
+**/config.private.json
+**/*.local.json
+**/*.private.json
+**/*.local.yaml
+**/*.local.yml
+**/*.local.toml
+**/*.local.ini
+**/.env
+**/.env.*
+!**/.env.example
+!**/*.example.json
+!**/*.example.yaml
+!**/*.example.yml
+!**/*.example.toml
+!**/*.example.ini
+
+# ----------------------------------------------------------------------
+# Diagnostics and machine exports
+# ----------------------------------------------------------------------
+*.log
+*.trace
+*.dmp
+*.mdmp
+*.etl
+*.evtx
+*.wer
+*.export.reg
+*.backup.reg
+*.machine.reg
+*.diagcab
+*.zip
+*.7z
+
+# ----------------------------------------------------------------------
+# Face captures and generated media
+# Keep intentional documentation artwork in docs/assets/ only.
+# ----------------------------------------------------------------------
+/captures/**
+/screenshots/**
+/diagnostics/**
+/test-results/**
+*.raw
+*.yuv
+*.nv12
+
+# ----------------------------------------------------------------------
+# Signing material and private keys
+# Public certificates may be committed only after explicit review.
+# ----------------------------------------------------------------------
+*.pfx
+*.p12
+*.p8
+*.key
+*.pem
+*.snk
+*.pvk
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+
+# ----------------------------------------------------------------------
+# Downloaded face-recognition models
+# Commit README, license notes, fetch scripts, and checksums instead.
+# ----------------------------------------------------------------------
+/models/*.onnx
+/models/*.bin
+/models/*.pb
+/models/*.tflite
+/models/*.pt
+/models/*.pth
+/models/*.safetensors
+!/models/README.md
+!/models/LICENSE*
+!/models/checksums.txt
+!/models/.gitkeep
+
+# ----------------------------------------------------------------------
+# Test coverage and temporary files
+# ----------------------------------------------------------------------
+TestResults/
+coverage/
+coverage.*
+*.coverage
+*.coveragexml
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+~$*
+.DS_Store
+Thumbs.db
+
+# ----------------------------------------------------------------------
+# Optional local editor settings
+# ----------------------------------------------------------------------
+.vscode/settings.json
+.vscode/*.local.json

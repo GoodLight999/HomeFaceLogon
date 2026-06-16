@@ -1,0 +1,14 @@
+{
+  "$schema": "./config.schema.json",
+  "schemaVersion": 1,
+  "enabled": false,
+  "targetSid": "S-1-5-21-0000000000-0000000000-0000000000-1001",
+  "qualifiedUserName": "ExampleProvider\\user@example.invalid",
+  "cameraSymbolicLink": "EXAMPLE_CAMERA_SYMBOLIC_LINK",
+  "matchThreshold": 0.0,
+  "requiredMatches": 3,
+  "windowSize": 5,
+  "scanTimeoutMs": 10000,
+  "hostStartupTimeoutMs": 3000,
+  "modelVersion": "NOT_DOWNLOADED"
+}
