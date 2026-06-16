@@ -15,6 +15,8 @@
 #include "CSampleProvider.h"
 #include "CSampleCredential.h"
 #include "guid.h"
+#include "log.h"
+#include "config.h"
 
 CSampleProvider::CSampleProvider():
     _cRef(1),
@@ -254,35 +256,111 @@ void CSampleProvider::_ReleaseEnumeratedCredentials()
     }
 }
 
+// Helper to convert GUID to wstring
+static std::wstring _GuidToString(const GUID& guid)
+{
+    wchar_t szGuid[64];
+    if (StringFromGUID2(guid, szGuid, 64) > 0)
+    {
+        return szGuid;
+    }
+    return L"{GUID-ERROR}";
+}
+
 HRESULT CSampleProvider::_EnumerateCredentials()
 {
+    LogInfo(L"Starting _EnumerateCredentials...");
+
+    AppConfig config;
+    bool configLoaded = LoadAppConfig(&config);
+    std::wstring targetSid = configLoaded ? config.targetSid : L"";
+    LogInfo(L"Config loaded: %s, targetSid: %s", 
+            configLoaded ? L"TRUE" : L"FALSE", 
+            MaskSid(targetSid).c_str());
+
     HRESULT hr = E_UNEXPECTED;
     if (_pCredProviderUserArray != nullptr)
     {
-        DWORD dwUserCount;
+        DWORD dwUserCount = 0;
         _pCredProviderUserArray->GetCount(&dwUserCount);
-        if (dwUserCount > 0)
+        LogInfo(L"Found %d user(s) in system user array.", dwUserCount);
+
+        ICredentialProviderUser* pTargetUser = nullptr;
+
+        for (DWORD i = 0; i < dwUserCount; ++i)
         {
-            ICredentialProviderUser *pCredUser;
-            hr = _pCredProviderUserArray->GetAt(0, &pCredUser);
-            if (SUCCEEDED(hr))
+            ICredentialProviderUser* pUser = nullptr;
+            if (SUCCEEDED(_pCredProviderUserArray->GetAt(i, &pUser)))
             {
-                _pCredential = new(std::nothrow) CSampleCredential();
-                if (_pCredential != nullptr)
+                PWSTR pszSid = nullptr;
+                PWSTR pszUserName = nullptr;
+                PWSTR pszDisplayName = nullptr;
+                PWSTR pszQualifiedName = nullptr;
+                GUID providerId = {};
+
+                pUser->GetSid(&pszSid);
+                pUser->GetProviderID(&providerId);
+                pUser->GetStringValue(PKEY_Identity_UserName, &pszUserName);
+                pUser->GetStringValue(PKEY_Identity_DisplayName, &pszDisplayName);
+                pUser->GetStringValue(PKEY_Identity_QualifiedUserName, &pszQualifiedName);
+
+                std::wstring wsSid = pszSid ? pszSid : L"";
+                std::wstring wsUserName = pszUserName ? pszUserName : L"";
+                std::wstring wsDisplayName = pszDisplayName ? pszDisplayName : L"";
+                std::wstring wsQualifiedName = pszQualifiedName ? pszQualifiedName : L"";
+
+                LogInfo(L"User[%d]: DisplayName='%ls', UserName='%ls', QualifiedName='%ls', SID='%ls', ProviderID='%ls'",
+                        i,
+                        wsDisplayName.c_str(),
+                        wsUserName.c_str(),
+                        MaskQualifiedUserName(wsQualifiedName).c_str(),
+                        MaskSid(wsSid).c_str(),
+                        _GuidToString(providerId).c_str());
+
+                if (!targetSid.empty() && _wcsicmp(wsSid.c_str(), targetSid.c_str()) == 0)
                 {
-                    hr = _pCredential->Initialize(_cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs, pCredUser);
-                    if (FAILED(hr))
-                    {
-                        _pCredential->Release();
-                        _pCredential = nullptr;
-                    }
+                    LogInfo(L"Found matching user at index %d.", i);
+                    pTargetUser = pUser;
+                    pTargetUser->AddRef();
+                }
+
+                if (pszSid) CoTaskMemFree(pszSid);
+                if (pszUserName) CoTaskMemFree(pszUserName);
+                if (pszDisplayName) CoTaskMemFree(pszDisplayName);
+                if (pszQualifiedName) CoTaskMemFree(pszQualifiedName);
+
+                pUser->Release();
+            }
+        }
+
+        if (pTargetUser != nullptr)
+        {
+            _pCredential = new(std::nothrow) CSampleCredential();
+            if (_pCredential != nullptr)
+            {
+                hr = _pCredential->Initialize(_cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs, pTargetUser);
+                if (FAILED(hr))
+                {
+                    LogError(L"CSampleCredential::Initialize failed: HRESULT=0x%08X", hr);
+                    _pCredential->Release();
+                    _pCredential = nullptr;
                 }
                 else
                 {
-                    hr = E_OUTOFMEMORY;
+                    LogInfo(L"CSampleCredential initialized successfully.");
                 }
-                pCredUser->Release();
             }
+            else
+            {
+                hr = E_OUTOFMEMORY;
+                LogError(L"Failed to allocate CSampleCredential.");
+            }
+            pTargetUser->Release();
+        }
+        else
+        {
+            LogInfo(L"No user in user array matched the targetSid.");
+            hr = S_OK;
         }
     }
     return hr;
