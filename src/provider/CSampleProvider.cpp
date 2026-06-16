@@ -148,6 +148,27 @@ HRESULT CSampleProvider::GetFieldDescriptorAt(
 }
 
 // Sets pdwCount to the number of tiles that we wish to show at this time.
+static bool _IsProviderEnabled()
+{
+    HKEY hKey;
+    bool enabled = false; // Default is disabled (Enabled = 0)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\HomeFaceLogon", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD dwType;
+        DWORD dwValue = 0;
+        DWORD dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"Enabled", nullptr, &dwType, reinterpret_cast<BYTE*>(&dwValue), &dwSize) == ERROR_SUCCESS)
+        {
+            if (dwType == REG_DWORD && dwValue != 0)
+            {
+                enabled = true;
+            }
+        }
+        RegCloseKey(hKey);
+    }
+    return enabled;
+}
+
 // Sets pdwDefault to the index of the tile which should be used as the default.
 // The default tile is the tile which will be shown in the zoomed view by default. If
 // more than one provider specifies a default the last used cred prov gets to pick
@@ -162,6 +183,12 @@ HRESULT CSampleProvider::GetCredentialCount(
     *pdwDefault = CREDENTIAL_PROVIDER_NO_DEFAULT;
     *pbAutoLogonWithDefault = FALSE;
 
+    if (!_IsProviderEnabled())
+    {
+        *pdwCount = 0;
+        return S_OK;
+    }
+
     if (_fRecreateEnumeratedCredentials)
     {
         _fRecreateEnumeratedCredentials = false;
@@ -169,7 +196,7 @@ HRESULT CSampleProvider::GetCredentialCount(
         _CreateEnumeratedCredentials();
     }
 
-    *pdwCount = 1;
+    *pdwCount = (_pCredential != nullptr) ? 1 : 0;
 
     return S_OK;
 }
