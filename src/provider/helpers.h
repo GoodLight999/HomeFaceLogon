@@ -99,3 +99,13 @@ HRESULT DomainUsernameStringAlloc(
     );
 
 HRESULT SplitDomainAndUsername(_In_ PCWSTR pszQualifiedUserName, _Outptr_result_nullonfailure_ PWSTR *ppszDomain, _Outptr_result_nullonfailure_ PWSTR *ppszUsername);
+
+HRESULT InitializeSecureSecurityAttributes(
+    _Out_ SECURITY_ATTRIBUTES* psa,
+    _Outptr_ PSECURITY_DESCRIPTOR* ppsd
+    );
+
+void FreeSecureSecurityAttributes(
+    _In_ SECURITY_ATTRIBUTES* psa,
+    _In_ PSECURITY_DESCRIPTOR psd
+    );

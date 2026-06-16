@@ -26,7 +26,14 @@ CSampleCredential::CSampleCredential():
     _fIsLocalUser(false),
     _fChecked(false),
     _fShowControls(false),
-    _dwComboIndex(0)
+    _dwComboIndex(0),
+    _hHostProcess(INVALID_HANDLE_VALUE),
+    _hHostJob(INVALID_HANDLE_VALUE),
+    _hPipe(INVALID_HANDLE_VALUE),
+    _hPipeReadThread(INVALID_HANDLE_VALUE),
+    _sessionNonceHi(0),
+    _sessionNonceLo(0),
+    _fScanning(false)
 {
     DllAddRef();
 
@@ -37,6 +44,8 @@ CSampleCredential::CSampleCredential():
 
 CSampleCredential::~CSampleCredential()
 {
+    _StopHostProcess();
+
     if (_rgFieldStrings[SFI_PASSWORD])
     {
         size_t lenPassword = wcslen(_rgFieldStrings[SFI_PASSWORD]);
@@ -82,7 +91,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
-        hr = SHStrDupW(L"Sample Credential Provider", &_rgFieldStrings[SFI_LARGE_TEXT]);
+        hr = SHStrDupW(L"Home Face Logon", &_rgFieldStrings[SFI_LARGE_TEXT]);
     }
     if (SUCCEEDED(hr))
     {
@@ -106,7 +115,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
-        hr = SHStrDupW(L"Launch helper window", &_rgFieldStrings[SFI_LAUNCHWINDOW_LINK]);
+        hr = SHStrDupW(L"顔照合を再試行", &_rgFieldStrings[SFI_LAUNCHWINDOW_LINK]);
     }
     if (SUCCEEDED(hr))
     {
@@ -150,19 +159,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
-        PWSTR pszLogonStatus;
-        pcpUser->GetStringValue(PKEY_Identity_LogonStatusString, &pszLogonStatus);
-        if (pszLogonStatus != nullptr)
-        {
-            wchar_t szString[256];
-            StringCchPrintf(szString, ARRAYSIZE(szString), L"Logon Status: %s", pszLogonStatus);
-            hr = SHStrDupW(szString, &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
-            CoTaskMemFree(pszLogonStatus);
-        }
-        else
-        {
-            hr = SHStrDupW(L"Logon Status is NULL", &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
-        }
+        hr = SHStrDupW(L"カメラの準備中...", &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
     }
 
     if (SUCCEEDED(hr))
@@ -186,6 +183,7 @@ HRESULT CSampleCredential::Advise(_In_ ICredentialProviderCredentialEvents *pcpc
 // LogonUI calls this to tell us to release the callback.
 HRESULT CSampleCredential::UnAdvise()
 {
+    _StopHostProcess();
     if (_pCredProvCredentialEvents)
     {
         _pCredProvCredentialEvents->Release();
@@ -203,6 +201,7 @@ HRESULT CSampleCredential::UnAdvise()
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
     *pbAutoLogon = FALSE;
+    _StartHostProcess();
     return S_OK;
 }
 
@@ -211,6 +210,8 @@ HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 // is to clear out the password field.
 HRESULT CSampleCredential::SetDeselected()
 {
+    _StopHostProcess();
+
     HRESULT hr = S_OK;
     if (_rgFieldStrings[SFI_PASSWORD])
     {
@@ -460,17 +461,11 @@ HRESULT CSampleCredential::CommandLinkClicked(DWORD dwFieldID)
     if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
         (CPFT_COMMAND_LINK == _rgCredProvFieldDescriptors[dwFieldID].cpft))
     {
-        HWND hwndOwner = nullptr;
         switch (dwFieldID)
         {
         case SFI_LAUNCHWINDOW_LINK:
-            if (_pCredProvCredentialEvents)
-            {
-                _pCredProvCredentialEvents->OnCreatingWindow(&hwndOwner);
-            }
-
-            // Pop a messagebox indicating the click.
-            ::MessageBox(hwndOwner, L"Command link clicked", L"Click!", 0);
+            _StopHostProcess();
+            _StartHostProcess();
             break;
         case SFI_HIDECONTROLS_LINK:
             _pCredProvCredentialEvents->BeginFieldUpdates();
@@ -698,4 +693,308 @@ HRESULT CSampleCredential::GetFieldOptions(DWORD dwFieldID,
     }
 
     return S_OK;
+}
+
+#include <bcrypt.h>
+#pragma comment(lib, "Bcrypt.lib")
+
+HRESULT CSampleCredential::_StartHostProcess()
+{
+    LogInfo(L"Starting FaceLogonHost helper process...");
+    
+    // Stop any existing process first
+    _StopHostProcess();
+
+    // 1. Generate Nonce
+    BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceHi), sizeof(_sessionNonceHi), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceLo), sizeof(_sessionNonceLo), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+
+    wchar_t nonceHex[33];
+    StringCchPrintfW(nonceHex, ARRAYSIZE(nonceHex), L"%016llx%016llx", _sessionNonceHi, _sessionNonceLo);
+
+    // 2. Setup Named Pipe
+    wchar_t pipeName[128];
+    StringCchPrintfW(pipeName, ARRAYSIZE(pipeName), L"\\\\.\\pipe\\HomeFaceLogonPipe_%lu_%s", GetCurrentProcessId(), nonceHex);
+
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR psd = nullptr;
+    HRESULT hr = InitializeSecureSecurityAttributes(&sa, &psd);
+    if (FAILED(hr))
+    {
+        LogError(L"InitializeSecureSecurityAttributes failed: 0x%08X", hr);
+        return hr;
+    }
+
+    _hPipe = CreateNamedPipeW(
+        pipeName,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        1,
+        1024,
+        1024,
+        0,
+        &sa
+    );
+
+    FreeSecureSecurityAttributes(&sa, psd);
+
+    if (_hPipe == INVALID_HANDLE_VALUE)
+    {
+        LogError(L"CreateNamedPipeW failed: %lu", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    // 3. Create Job Object to tie host life to Winlogon/CP
+    _hHostJob = CreateJobObjectW(nullptr, nullptr);
+    if (_hHostJob != nullptr)
+    {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(_hHostJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
+
+    // 4. Resolve host executable path
+    // Under Winlogon, it resides in C:\Program Files\HomeFaceLogon\FaceLogonHost.exe
+    // During dev, fallback to exe relative directory or current workspace path
+    wchar_t hostPath[MAX_PATH] = L"C:\\Program Files\\HomeFaceLogon\\FaceLogonHost.exe";
+    if (!PathFileExistsW(hostPath))
+    {
+        // Try relative to DLL path
+        HMODULE hDll = GetModuleHandleW(L"FaceLogonProvider.dll");
+        if (hDll && GetModuleFileNameW(hDll, hostPath, MAX_PATH))
+        {
+            PathRemoveFileSpecW(hostPath);
+            PathAppendW(hostPath, L"FaceLogonHost.exe");
+        }
+    }
+    if (!PathFileExistsW(hostPath))
+    {
+        // Debug fallback
+        HMODULE hDll = GetModuleHandleW(L"FaceLogonProvider.dll");
+        if (hDll && GetModuleFileNameW(hDll, hostPath, MAX_PATH))
+        {
+            PathRemoveFileSpecW(hostPath); // Debug or Release
+            PathRemoveFileSpecW(hostPath); // x64
+            PathRemoveFileSpecW(hostPath); // Workspace Root
+            PathAppendW(hostPath, L"x64\\Debug\\FaceLogonHost.exe");
+            if (!PathFileExistsW(hostPath))
+            {
+                // Try Release
+                PathRemoveFileSpecW(hostPath);
+                PathAppendW(hostPath, L"Release\\FaceLogonHost.exe");
+            }
+        }
+    }
+
+    LogInfo(L"Launching helper host path: %ls", hostPath);
+
+    // 5. Build Command Line arguments
+    wchar_t cmdLine[512];
+    StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine), L"\"%s\" --pipe \"%s\" --nonce %s", hostPath, pipeName, nonceHex);
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        cmdLine,
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+
+    if (!ok)
+    {
+        LogError(L"CreateProcessW failed: %lu", GetLastError());
+        CloseHandle(_hPipe);
+        _hPipe = INVALID_HANDLE_VALUE;
+        if (_hHostJob != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(_hHostJob);
+            _hHostJob = INVALID_HANDLE_VALUE;
+        }
+        _UpdateStatusText(L"ヘルパープロセスの起動に失敗しました");
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    _hHostProcess = pi.hProcess;
+    CloseHandle(pi.hThread);
+
+    if (_hHostJob != INVALID_HANDLE_VALUE)
+    {
+        AssignProcessToJobObject(_hHostJob, _hHostProcess);
+    }
+
+    _fScanning = true;
+
+    // 6. Start Named Pipe Read Thread
+    _hPipeReadThread = CreateThread(nullptr, 0, _PipeReadThreadProc, this, 0, nullptr);
+    
+    _UpdateStatusText(L"カメラを準備しています...");
+    return S_OK;
+}
+
+void CSampleCredential::_StopHostProcess()
+{
+    _fScanning = false;
+
+    // 1. Terminate or Shutdown Host Process
+    if (_hHostProcess != INVALID_HANDLE_VALUE)
+    {
+        // Try sending MSG_SHUTDOWN message to pipe before force-killing
+        if (_hPipe != INVALID_HANDLE_VALUE)
+        {
+            struct MessageHeader {
+                uint32_t magic;
+                uint16_t version;
+                uint16_t type;
+                uint32_t payloadSize;
+                uint64_t sessionNonceHi;
+                uint64_t sessionNonceLo;
+            } header = {};
+            header.magic = 0x4F4C4648; // 'HFLO'
+            header.version = 1;
+            header.type = 8; // MSG_SHUTDOWN
+            header.sessionNonceHi = _sessionNonceHi;
+            header.sessionNonceLo = _sessionNonceLo;
+
+            DWORD bytesWritten = 0;
+            WriteFile(_hPipe, &header, sizeof(header), &bytesWritten, nullptr);
+        }
+
+        // Force kill if necessary after brief delay, or just let Job Object handle it
+        TerminateProcess(_hHostProcess, 0);
+        CloseHandle(_hHostProcess);
+        _hHostProcess = INVALID_HANDLE_VALUE;
+    }
+
+    // 2. Clean up Job Object
+    if (_hHostJob != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(_hHostJob);
+        _hHostJob = INVALID_HANDLE_VALUE;
+    }
+
+    // 3. Close Named Pipe
+    if (_hPipe != INVALID_HANDLE_VALUE)
+    {
+        // Disconnect first to unblock any waiting thread
+        DisconnectNamedPipe(_hPipe);
+        CloseHandle(_hPipe);
+        _hPipe = INVALID_HANDLE_VALUE;
+    }
+
+    // 4. Wait for Read Thread
+    if (_hPipeReadThread != INVALID_HANDLE_VALUE)
+    {
+        WaitForSingleObject(_hPipeReadThread, 1000);
+        CloseHandle(_hPipeReadThread);
+        _hPipeReadThread = INVALID_HANDLE_VALUE;
+    }
+
+    _sessionNonceHi = 0;
+    _sessionNonceLo = 0;
+}
+
+DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
+{
+    CSampleCredential* pThis = reinterpret_cast<CSampleCredential*>(lpParam);
+    if (!pThis) return 0;
+
+    LogInfo(L"Pipe read thread started.");
+
+    // ConnectNamedPipe will block until client connects
+    BOOL connected = ConnectNamedPipe(pThis->_hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+    if (!connected)
+    {
+        LogError(L"ConnectNamedPipe failed: %lu", GetLastError());
+        return 0;
+    }
+
+    LogInfo(L"Pipe client connected.");
+
+    struct MessageHeader {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t type;
+        uint32_t payloadSize;
+        uint64_t sessionNonceHi;
+        uint64_t sessionNonceLo;
+    };
+
+    while (pThis->_fScanning)
+    {
+        MessageHeader header = {};
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(pThis->_hPipe, &header, sizeof(header), &bytesRead, nullptr);
+        if (!ok || bytesRead == 0)
+        {
+            // Disconnect or error
+            break;
+        }
+
+        if (bytesRead == sizeof(header))
+        {
+            if (header.magic == 0x4F4C4648 &&
+                header.sessionNonceHi == pThis->_sessionNonceHi &&
+                header.sessionNonceLo == pThis->_sessionNonceLo)
+            {
+                pThis->_HandlePipeMessage(header.type);
+            }
+            else
+            {
+                LogError(L"Received message with invalid magic or session nonce.");
+            }
+        }
+    }
+
+    LogInfo(L"Pipe read thread exiting.");
+    return 0;
+}
+
+void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
+{
+    switch (msgType)
+    {
+    case 3: // MSG_STATUS
+        _UpdateStatusText(L"顔を探しています...");
+        break;
+    case 4: // MSG_MATCHED
+        _UpdateStatusText(L"顔が一致しました。サインインしています...");
+        break;
+    case 5: // MSG_NO_MATCH
+        _UpdateStatusText(L"登録された顔と一致しません");
+        break;
+    case 6: // MSG_CAMERA_ERROR
+        _UpdateStatusText(L"カメラを開けませんでした。カメラが他のアプリに使用されていないか確認してください。");
+        break;
+    case 7: // MSG_MODEL_ERROR
+        _UpdateStatusText(L"顔認識モデルの初期化に失敗しました。");
+        break;
+    default:
+        break;
+    }
+}
+
+void CSampleCredential::_UpdateStatusText(PCWSTR pwszStatus)
+{
+    LogInfo(L"Status Update: %ls", pwszStatus);
+
+    if (_rgFieldStrings[SFI_LOGONSTATUS_TEXT])
+    {
+        CoTaskMemFree(_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
+        _rgFieldStrings[SFI_LOGONSTATUS_TEXT] = nullptr;
+    }
+
+    SHStrDupW(pwszStatus, &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
+
+    if (_pCredProvCredentialEvents)
+    {
+        _pCredProvCredentialEvents->SetFieldString(this, SFI_LOGONSTATUS_TEXT, _rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
+    }
 }

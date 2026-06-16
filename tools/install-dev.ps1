@@ -35,11 +35,17 @@ if (-not (Test-Path $exeSource)) {
 }
 if (Test-Path $exeSource) {
     Copy-Item -Path $exeSource -Destination (Join-Path $installDir "FaceLogonSetup.exe") -Force
-    # Copy OpenCV DLLs based on build config
-    $binDir = Join-Path $PSScriptRoot "..\x64\$config"
-    Get-ChildItem -Path $binDir -Filter "*.dll" | ForEach-Object {
-        Copy-Item -Path $_.FullName -Destination $installDir -Force
-    }
+}
+
+$hostSource = Join-Path $PSScriptRoot "..\x64\$config\FaceLogonHost.exe"
+if (Test-Path $hostSource) {
+    Copy-Item -Path $hostSource -Destination (Join-Path $installDir "FaceLogonHost.exe") -Force
+}
+
+# Copy OpenCV DLLs based on build config
+$binDir = Join-Path $PSScriptRoot "..\x64\$config"
+Get-ChildItem -Path $binDir -Filter "*.dll" | Where-Object { $_.Name -ne "FaceLogonProvider.dll" -and $_.Name -ne "FaceLogonSetup.exe" -and $_.Name -ne "FaceLogonHost.exe" } | ForEach-Object {
+    Copy-Item -Path $_.FullName -Destination $installDir -Force
 }
 
 # 3. Create settings and logs directories

@@ -5,6 +5,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SampleV2CredentialProvider"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FaceLogonSetup", "src\setup\FaceLogonSetup.vcxproj", "{4F7A5B8C-9D0E-4F3A-BD8C-12A4B5C6D7E8}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FaceLogonHost", "src\host\FaceLogonHost.vcxproj", "{9EFA81CB-D2A4-4B2E-9C80-5CBE4F5E68C1}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -25,6 +27,10 @@ Global
 		{4F7A5B8C-9D0E-4F3A-BD8C-12A4B5C6D7E8}.Debug|x64.Build.0 = Debug|x64
 		{4F7A5B8C-9D0E-4F3A-BD8C-12A4B5C6D7E8}.Release|x64.ActiveCfg = Release|x64
 		{4F7A5B8C-9D0E-4F3A-BD8C-12A4B5C6D7E8}.Release|x64.Build.0 = Release|x64
+		{9EFA81CB-D2A4-4B2E-9C80-5CBE4F5E68C1}.Debug|x64.ActiveCfg = Debug|x64
+		{9EFA81CB-D2A4-4B2E-9C80-5CBE4F5E68C1}.Debug|x64.Build.0 = Debug|x64
+		{9EFA81CB-D2A4-4B2E-9C80-5CBE4F5E68C1}.Release|x64.ActiveCfg = Release|x64
+		{9EFA81CB-D2A4-4B2E-9C80-5CBE4F5E68C1}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

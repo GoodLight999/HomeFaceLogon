@@ -19,6 +19,7 @@
 #include <strsafe.h>
 #include <shlguid.h>
 #include <propkey.h>
+#include <stdint.h>
 #include "common.h"
 #include "dll.h"
 #include "resource.h"
@@ -117,4 +118,19 @@ public:
     DWORD                                   _dwComboIndex;                                  // Tracks the current index of our combobox.
     bool                                    _fShowControls;                                 // Tracks the state of our show/hide controls link.
     bool                                    _fIsLocalUser;                                  // If the cred prov is assosiating with a local user tile
+
+    // Host IPC and lifetime management
+    HANDLE                                  _hHostProcess;
+    HANDLE                                  _hHostJob;
+    HANDLE                                  _hPipe;
+    HANDLE                                  _hPipeReadThread;
+    uint64_t                                _sessionNonceHi;
+    uint64_t                                _sessionNonceLo;
+    bool                                    _fScanning;
+
+    HRESULT _StartHostProcess();
+    void _StopHostProcess();
+    static DWORD WINAPI _PipeReadThreadProc(LPVOID lpParam);
+    void _HandlePipeMessage(uint16_t msgType);
+    void _UpdateStatusText(PCWSTR pwszStatus);
 };

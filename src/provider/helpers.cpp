@@ -708,3 +708,51 @@ HRESULT SplitDomainAndUsername(_In_ PCWSTR pszQualifiedUserName, _Outptr_result_
     }
     return hr;
 }
+
+#include <sddl.h>
+
+HRESULT InitializeSecureSecurityAttributes(
+    _Out_ SECURITY_ATTRIBUTES* psa,
+    _Outptr_ PSECURITY_DESCRIPTOR* ppsd
+    )
+{
+    if (!psa || !ppsd)
+    {
+        return E_POINTER;
+    }
+
+    *ppsd = nullptr;
+    psa->nLength = sizeof(SECURITY_ATTRIBUTES);
+    psa->bInheritHandle = FALSE;
+
+    // SDDL: SYSTEM (SY) and Administrators (BA) get Generic All (GA) access
+    PCWSTR sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)";
+    
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        ppsd,
+        nullptr
+    ))
+    {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    psa->lpSecurityDescriptor = *ppsd;
+    return S_OK;
+}
+
+void FreeSecureSecurityAttributes(
+    _In_ SECURITY_ATTRIBUTES* psa,
+    _In_ PSECURITY_DESCRIPTOR psd
+    )
+{
+    if (psd)
+    {
+        LocalFree(psd);
+    }
+    if (psa)
+    {
+        psa->lpSecurityDescriptor = nullptr;
+    }
+}
