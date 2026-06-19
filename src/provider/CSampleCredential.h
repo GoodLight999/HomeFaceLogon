@@ -114,15 +114,16 @@ public:
     PWSTR                                   _pszQualifiedUserName;                          // The user name that's used to pack the authentication buffer
     ICredentialProviderCredentialEvents2*    _pCredProvCredentialEvents;                    // Used to update fields.
                                                                                             // CredentialEvents2 for Begin and EndFieldUpdates.
-    BOOL                                    _fChecked;                                      // Tracks the state of our checkbox.
-    DWORD                                   _dwComboIndex;                                  // Tracks the current index of our combobox.
-    bool                                    _fShowControls;                                 // Tracks the state of our show/hide controls link.
-    bool                                    _fIsLocalUser;                                  // If the cred prov is assosiating with a local user tile
+    BOOL                                    _fIsLocalUser;                                  // If the cred prov is assosiating with a local user tile
+    bool                                    _fFaceAuthSuccess;                              // True if face authentication matched successfully
+    ULONGLONG                               _llCreationTime;                                // Timestamp when helper process starts (GetTickCount64)
 
     // Host IPC and lifetime management
+    class CSampleProvider*                  _pProvider;
     HANDLE                                  _hHostProcess;
     HANDLE                                  _hHostJob;
     HANDLE                                  _hPipe;
+    HANDLE                                  _hPipeEvent;
     HANDLE                                  _hPipeReadThread;
     uint64_t                                _sessionNonceHi;
     uint64_t                                _sessionNonceLo;
@@ -133,4 +134,10 @@ public:
     static DWORD WINAPI _PipeReadThreadProc(LPVOID lpParam);
     void _HandlePipeMessage(uint16_t msgType);
     void _UpdateStatusText(PCWSTR pwszStatus);
+
+  public:
+    void SetProvider(class CSampleProvider* pProvider)
+    {
+        _pProvider = pProvider;
+    }
 };

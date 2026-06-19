@@ -21,7 +21,10 @@
 CSampleProvider::CSampleProvider():
     _cRef(1),
     _pCredential(nullptr),
-    _pCredProviderUserArray(nullptr)
+    _pCredProviderUserArray(nullptr),
+    _pcpe(nullptr),
+    _upAdviseContext(0),
+    _fAutoLogon(false)
 {
     DllAddRef();
     LogInfo(L"CSampleProvider constructor called.");
@@ -39,6 +42,11 @@ CSampleProvider::~CSampleProvider()
     {
         _pCredProviderUserArray->Release();
         _pCredProviderUserArray = nullptr;
+    }
+    if (_pcpe != nullptr)
+    {
+        _pcpe->Release();
+        _pcpe = nullptr;
     }
 
     DllRelease();
@@ -106,16 +114,32 @@ HRESULT CSampleProvider::SetSerialization(
 // Called by LogonUI to give you a callback.  Providers often use the callback if they
 // some event would cause them to need to change the set of tiles that they enumerated.
 HRESULT CSampleProvider::Advise(
-    _In_ ICredentialProviderEvents * /*pcpe*/,
-    _In_ UINT_PTR /*upAdviseContext*/)
+    _In_ ICredentialProviderEvents *pcpe,
+    _In_ UINT_PTR upAdviseContext)
 {
-    return E_NOTIMPL;
+    if (_pcpe != nullptr)
+    {
+        _pcpe->Release();
+    }
+    _pcpe = pcpe;
+    if (_pcpe != nullptr)
+    {
+        _pcpe->AddRef();
+    }
+    _upAdviseContext = upAdviseContext;
+    return S_OK;
 }
 
 // Called by LogonUI when the ICredentialProviderEvents callback is no longer valid.
 HRESULT CSampleProvider::UnAdvise()
 {
-    return E_NOTIMPL;
+    if (_pcpe != nullptr)
+    {
+        _pcpe->Release();
+        _pcpe = nullptr;
+    }
+    _upAdviseContext = 0;
+    return S_OK;
 }
 
 // Called by LogonUI to determine the number of fields in your tiles.  This
@@ -191,6 +215,7 @@ HRESULT CSampleProvider::GetCredentialCount(
     if (!_IsProviderEnabled())
     {
         *pdwCount = 0;
+        LogInfo(L"GetCredentialCount called (disabled): count=0");
         return S_OK;
     }
 
@@ -203,6 +228,16 @@ HRESULT CSampleProvider::GetCredentialCount(
 
     *pdwCount = (_pCredential != nullptr) ? 1 : 0;
 
+    if (_fAutoLogon && _pCredential != nullptr)
+    {
+        *pdwDefault = 0;
+        *pbAutoLogonWithDefault = TRUE;
+        _fAutoLogon = false; // Reset after returning it to LogonUI
+    }
+
+    LogInfo(L"GetCredentialCount called: count=%lu, default=%lu, autoLogon=%d", 
+            *pdwCount, *pdwDefault, *pbAutoLogonWithDefault);
+
     return S_OK;
 }
 
@@ -212,6 +247,7 @@ HRESULT CSampleProvider::GetCredentialAt(
     DWORD dwIndex,
     _Outptr_result_nullonfailure_ ICredentialProviderCredential **ppcpc)
 {
+    LogInfo(L"GetCredentialAt called: dwIndex=%lu", dwIndex);
     HRESULT hr = E_INVALIDARG;
     *ppcpc = nullptr;
 
@@ -341,6 +377,7 @@ HRESULT CSampleProvider::_EnumerateCredentials()
             _pCredential = new(std::nothrow) CSampleCredential();
             if (_pCredential != nullptr)
             {
+                _pCredential->SetProvider(this);
                 hr = _pCredential->Initialize(_cpus, s_rgCredProvFieldDescriptors, s_rgFieldStatePairs, pTargetUser);
                 if (FAILED(hr))
                 {

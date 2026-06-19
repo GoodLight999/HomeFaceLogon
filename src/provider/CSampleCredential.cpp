@@ -14,22 +14,32 @@
 #endif
 #include <unknwn.h>
 #include "CSampleCredential.h"
+#include "CSampleProvider.h"
 #include "guid.h"
 #include "log.h"
 #include "config.h"
 
+// Tracks if we are currently signing in using face auth to prevent multiple host launches.
+static bool g_fAutoLogonInProgress = false;
+static ULONGLONG g_llLastAuthSuccessTime = 0;
+
+// Tracks PIN attempts globally across instances to prevent brute force lock bypass by tile toggling
+static int g_nPinAttempts = 0;
+static ULONGLONG g_lockoutExpiration = 0;
+
 CSampleCredential::CSampleCredential():
     _cRef(1),
+    _pProvider(nullptr),
     _pCredProvCredentialEvents(nullptr),
     _pszUserSid(nullptr),
     _pszQualifiedUserName(nullptr),
     _fIsLocalUser(false),
-    _fChecked(false),
-    _fShowControls(false),
-    _dwComboIndex(0),
+    _fFaceAuthSuccess(false),
+    _llCreationTime(0),
     _hHostProcess(INVALID_HANDLE_VALUE),
     _hHostJob(INVALID_HANDLE_VALUE),
     _hPipe(INVALID_HANDLE_VALUE),
+    _hPipeEvent(nullptr),
     _hPipeReadThread(INVALID_HANDLE_VALUE),
     _sessionNonceHi(0),
     _sessionNonceLo(0),
@@ -87,15 +97,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     // Initialize the String value of all the fields.
     if (SUCCEEDED(hr))
     {
-        hr = SHStrDupW(L"Sample Credential", &_rgFieldStrings[SFI_LABEL]);
-    }
-    if (SUCCEEDED(hr))
-    {
         hr = SHStrDupW(L"Home Face Logon", &_rgFieldStrings[SFI_LARGE_TEXT]);
-    }
-    if (SUCCEEDED(hr))
-    {
-        hr = SHStrDupW(L"Edit Text", &_rgFieldStrings[SFI_EDIT_TEXT]);
     }
     if (SUCCEEDED(hr))
     {
@@ -103,15 +105,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
-        hr = SHStrDupW(L"Submit", &_rgFieldStrings[SFI_SUBMIT_BUTTON]);
-    }
-    if (SUCCEEDED(hr))
-    {
-        hr = SHStrDupW(L"Checkbox", &_rgFieldStrings[SFI_CHECKBOX]);
-    }
-    if (SUCCEEDED(hr))
-    {
-        hr = SHStrDupW(L"Combobox", &_rgFieldStrings[SFI_COMBOBOX]);
+        hr = SHStrDupW(L"サインイン", &_rgFieldStrings[SFI_SUBMIT_BUTTON]);
     }
     if (SUCCEEDED(hr))
     {
@@ -119,49 +113,12 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
-        hr = SHStrDupW(L"Hide additional controls", &_rgFieldStrings[SFI_HIDECONTROLS_LINK]);
+        hr = SHStrDupW(L"カメラの準備中...", &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
     }
     if (SUCCEEDED(hr))
     {
         hr = pcpUser->GetStringValue(PKEY_Identity_QualifiedUserName, &_pszQualifiedUserName);
     }
-    if (SUCCEEDED(hr))
-    {
-        PWSTR pszUserName;
-        pcpUser->GetStringValue(PKEY_Identity_UserName, &pszUserName);
-        if (pszUserName != nullptr)
-        {
-            wchar_t szString[256];
-            StringCchPrintf(szString, ARRAYSIZE(szString), L"User Name: %s", pszUserName);
-            hr = SHStrDupW(szString, &_rgFieldStrings[SFI_FULLNAME_TEXT]);
-            CoTaskMemFree(pszUserName);
-        }
-        else
-        {
-            hr =  SHStrDupW(L"User Name is NULL", &_rgFieldStrings[SFI_FULLNAME_TEXT]);
-        }
-    }
-    if (SUCCEEDED(hr))
-    {
-        PWSTR pszDisplayName;
-        pcpUser->GetStringValue(PKEY_Identity_DisplayName, &pszDisplayName);
-        if (pszDisplayName != nullptr)
-        {
-            wchar_t szString[256];
-            StringCchPrintf(szString, ARRAYSIZE(szString), L"Display Name: %s", pszDisplayName);
-            hr = SHStrDupW(szString, &_rgFieldStrings[SFI_DISPLAYNAME_TEXT]);
-            CoTaskMemFree(pszDisplayName);
-        }
-        else
-        {
-            hr = SHStrDupW(L"Display Name is NULL", &_rgFieldStrings[SFI_DISPLAYNAME_TEXT]);
-        }
-    }
-    if (SUCCEEDED(hr))
-    {
-        hr = SHStrDupW(L"カメラの準備中...", &_rgFieldStrings[SFI_LOGONSTATUS_TEXT]);
-    }
-
     if (SUCCEEDED(hr))
     {
         hr = pcpUser->GetSid(&_pszUserSid);
@@ -334,6 +291,10 @@ HRESULT CSampleCredential::SetStringValue(DWORD dwFieldID, _In_ PCWSTR pwz)
         CPFT_PASSWORD_TEXT == _rgCredProvFieldDescriptors[dwFieldID].cpft))
     {
         PWSTR *ppwszStored = &_rgFieldStrings[dwFieldID];
+        if (*ppwszStored != nullptr && dwFieldID == SFI_PASSWORD)
+        {
+            SecureZeroMemory(*ppwszStored, wcslen(*ppwszStored) * sizeof(wchar_t));
+        }
         CoTaskMemFree(*ppwszStored);
         hr = SHStrDupW(pwz, ppwszStored);
     }
@@ -346,108 +307,39 @@ HRESULT CSampleCredential::SetStringValue(DWORD dwFieldID, _In_ PCWSTR pwz)
 }
 
 // Returns whether a checkbox is checked or not as well as its label.
-HRESULT CSampleCredential::GetCheckboxValue(DWORD dwFieldID, _Out_ BOOL *pbChecked, _Outptr_result_nullonfailure_ PWSTR *ppwszLabel)
+HRESULT CSampleCredential::GetCheckboxValue(DWORD /*dwFieldID*/, _Out_ BOOL *pbChecked, _Outptr_result_nullonfailure_ PWSTR *ppwszLabel)
 {
-    HRESULT hr;
+    *pbChecked = FALSE;
     *ppwszLabel = nullptr;
-
-    // Validate parameters.
-    if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
-        (CPFT_CHECKBOX == _rgCredProvFieldDescriptors[dwFieldID].cpft))
-    {
-        *pbChecked = _fChecked;
-        hr = SHStrDupW(_rgFieldStrings[SFI_CHECKBOX], ppwszLabel);
-    }
-    else
-    {
-        hr = E_INVALIDARG;
-    }
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 // Sets whether the specified checkbox is checked or not.
-HRESULT CSampleCredential::SetCheckboxValue(DWORD dwFieldID, BOOL bChecked)
+HRESULT CSampleCredential::SetCheckboxValue(DWORD /*dwFieldID*/, BOOL /*bChecked*/)
 {
-    HRESULT hr;
-
-    // Validate parameters.
-    if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
-        (CPFT_CHECKBOX == _rgCredProvFieldDescriptors[dwFieldID].cpft))
-    {
-        _fChecked = bChecked;
-        hr = S_OK;
-    }
-    else
-    {
-        hr = E_INVALIDARG;
-    }
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 // Returns the number of items to be included in the combobox (pcItems), as well as the
 // currently selected item (pdwSelectedItem).
-HRESULT CSampleCredential::GetComboBoxValueCount(DWORD dwFieldID, _Out_ DWORD *pcItems, _Deref_out_range_(<, *pcItems) _Out_ DWORD *pdwSelectedItem)
+HRESULT CSampleCredential::GetComboBoxValueCount(DWORD /*dwFieldID*/, _Out_ DWORD *pcItems, _Out_ DWORD *pdwSelectedItem)
 {
-    HRESULT hr;
     *pcItems = 0;
     *pdwSelectedItem = 0;
-
-    // Validate parameters.
-    if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
-        (CPFT_COMBOBOX == _rgCredProvFieldDescriptors[dwFieldID].cpft))
-    {
-        *pcItems = ARRAYSIZE(s_rgComboBoxStrings);
-        *pdwSelectedItem = 0;
-        hr = S_OK;
-    }
-    else
-    {
-        hr = E_INVALIDARG;
-    }
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 // Called iteratively to fill the combobox with the string (ppwszItem) at index dwItem.
-HRESULT CSampleCredential::GetComboBoxValueAt(DWORD dwFieldID, DWORD dwItem, _Outptr_result_nullonfailure_ PWSTR *ppwszItem)
+HRESULT CSampleCredential::GetComboBoxValueAt(DWORD /*dwFieldID*/, DWORD /*dwItem*/, _Outptr_result_nullonfailure_ PWSTR *ppwszItem)
 {
-    HRESULT hr;
     *ppwszItem = nullptr;
-
-    // Validate parameters.
-    if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
-        (CPFT_COMBOBOX == _rgCredProvFieldDescriptors[dwFieldID].cpft))
-    {
-        hr = SHStrDupW(s_rgComboBoxStrings[dwItem], ppwszItem);
-    }
-    else
-    {
-        hr = E_INVALIDARG;
-    }
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 // Called when the user changes the selected item in the combobox.
-HRESULT CSampleCredential::SetComboBoxSelectedValue(DWORD dwFieldID, DWORD dwSelectedItem)
+HRESULT CSampleCredential::SetComboBoxSelectedValue(DWORD /*dwFieldID*/, DWORD /*dwSelectedItem*/)
 {
-    HRESULT hr;
-
-    // Validate parameters.
-    if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
-        (CPFT_COMBOBOX == _rgCredProvFieldDescriptors[dwFieldID].cpft))
-    {
-        _dwComboIndex = dwSelectedItem;
-        hr = S_OK;
-    }
-    else
-    {
-        hr = E_INVALIDARG;
-    }
-
-    return hr;
+    return E_NOTIMPL;
 }
 
 // Called when the user clicks a command link.
@@ -455,35 +347,18 @@ HRESULT CSampleCredential::CommandLinkClicked(DWORD dwFieldID)
 {
     HRESULT hr = S_OK;
 
-    CREDENTIAL_PROVIDER_FIELD_STATE cpfsShow = CPFS_HIDDEN;
-
-    // Validate parameter.
     if (dwFieldID < ARRAYSIZE(_rgCredProvFieldDescriptors) &&
         (CPFT_COMMAND_LINK == _rgCredProvFieldDescriptors[dwFieldID].cpft))
     {
-        switch (dwFieldID)
+        if (dwFieldID == SFI_LAUNCHWINDOW_LINK)
         {
-        case SFI_LAUNCHWINDOW_LINK:
             _StopHostProcess();
             _StartHostProcess();
-            break;
-        case SFI_HIDECONTROLS_LINK:
-            _pCredProvCredentialEvents->BeginFieldUpdates();
-            cpfsShow = _fShowControls ? CPFS_DISPLAY_IN_SELECTED_TILE : CPFS_HIDDEN;
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_FULLNAME_TEXT, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_DISPLAYNAME_TEXT, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_LOGONSTATUS_TEXT, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_CHECKBOX, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_EDIT_TEXT, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldState(nullptr, SFI_COMBOBOX, cpfsShow);
-            _pCredProvCredentialEvents->SetFieldString(nullptr, SFI_HIDECONTROLS_LINK, _fShowControls? L"Hide additional controls" : L"Show additional controls");
-            _pCredProvCredentialEvents->EndFieldUpdates();
-            _fShowControls = !_fShowControls;
-            break;
-        default:
+        }
+        else
+        {
             hr = E_INVALIDARG;
         }
-
     }
     else
     {
@@ -501,11 +376,91 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                                             _Outptr_result_maybenull_ PWSTR *ppwszOptionalStatusText,
                                             _Out_ CREDENTIAL_PROVIDER_STATUS_ICON *pcpsiOptionalStatusIcon)
 {
+    LogInfo(L"GetSerialization called: _fIsLocalUser=%d, QualifiedUserName='%s'", _fIsLocalUser, _pszQualifiedUserName ? _pszQualifiedUserName : L"NULL");
+    _StopHostProcess();
+
+    if (_fFaceAuthSuccess)
+    {
+        g_fAutoLogonInProgress = true;
+        g_llLastAuthSuccessTime = GetTickCount64();
+    }
+
     HRESULT hr = E_UNEXPECTED;
     *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
     ZeroMemory(pcpcs, sizeof(*pcpcs));
+
+    // Check lockout first
+    if (g_nPinAttempts >= 5)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now < g_lockoutExpiration)
+        {
+            *ppwszOptionalStatusText = nullptr;
+            SHStrDupW(L"PIN の入力に何度も失敗したため、一時的にロックされています。30秒後に再試行してください。", ppwszOptionalStatusText);
+            return E_ACCESSDENIED;
+        }
+        else
+        {
+            g_nPinAttempts = 0;
+            g_lockoutExpiration = 0;
+        }
+    }
+
+    bool authValid = false;
+
+    // Case 1: User submitted a PIN (password field is not empty)
+    if (_rgFieldStrings[SFI_PASSWORD] && _rgFieldStrings[SFI_PASSWORD][0] != L'\0')
+    {
+        if (VerifyPin(_rgFieldStrings[SFI_PASSWORD]))
+        {
+            authValid = true;
+            g_nPinAttempts = 0;
+        }
+        else
+        {
+            g_nPinAttempts++;
+            if (g_nPinAttempts >= 5)
+            {
+                g_lockoutExpiration = GetTickCount64() + 30000; // 30 seconds
+                *ppwszOptionalStatusText = nullptr;
+                SHStrDupW(L"PIN が正しくありません。5回連続で失敗したため、30秒間ロックされます。", ppwszOptionalStatusText);
+            }
+            else
+            {
+                wchar_t szErr[128];
+                StringCchPrintfW(szErr, ARRAYSIZE(szErr), L"PIN が正しくありません。残り %d 回入力できます。", 5 - g_nPinAttempts);
+                *ppwszOptionalStatusText = nullptr;
+                SHStrDupW(szErr, ppwszOptionalStatusText);
+            }
+            // Clear the password field in the UI
+            CoTaskMemFree(_rgFieldStrings[SFI_PASSWORD]);
+            SHStrDupW(L"", &_rgFieldStrings[SFI_PASSWORD]);
+            if (_pCredProvCredentialEvents)
+            {
+                _pCredProvCredentialEvents->SetFieldString(this, SFI_PASSWORD, _rgFieldStrings[SFI_PASSWORD]);
+            }
+            return E_ACCESSDENIED;
+        }
+    }
+    // Case 2: Auto-logon triggered by successful face auth
+    else if (_fFaceAuthSuccess)
+    {
+        authValid = true;
+    }
+    // Case 3: Neither PIN entered nor face auth succeeded (user just clicked submit button with empty PIN field)
+    else
+    {
+        *ppwszOptionalStatusText = nullptr;
+        SHStrDupW(L"PIN を入力するか、顔認証を行ってください。", ppwszOptionalStatusText);
+        return E_ACCESSDENIED;
+    }
+
+    if (!authValid)
+    {
+        return E_ACCESSDENIED;
+    }
 
     PWSTR pwzDecryptedPassword = nullptr;
     if (!LoadAndDecryptPassword(&pwzDecryptedPassword))
@@ -598,6 +553,10 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
         CoTaskMemFree(pwzDecryptedPassword);
     }
 
+    _fFaceAuthSuccess = false;
+
+    LogInfo(L"GetSerialization finished: hr=0x%08X, pcpgsr=%d, cbSerialization=%lu, ulAuthPackage=%lu", 
+            hr, *pcpgsr, pcpcs->cbSerialization, pcpcs->ulAuthenticationPackage);
     return hr;
 }
 
@@ -624,6 +583,8 @@ HRESULT CSampleCredential::ReportResult(NTSTATUS ntsStatus,
                                         _Outptr_result_maybenull_ PWSTR *ppwszOptionalStatusText,
                                         _Out_ CREDENTIAL_PROVIDER_STATUS_ICON *pcpsiOptionalStatusIcon)
 {
+    _StopHostProcess();
+
     LogInfo(L"ReportResult: ntsStatus=0x%08X, ntsSubstatus=0x%08X", ntsStatus, ntsSubstatus);
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
@@ -648,9 +609,13 @@ HRESULT CSampleCredential::ReportResult(NTSTATUS ntsStatus,
         }
     }
 
+    // Reset face auth success flag
+    _fFaceAuthSuccess = false;
+
     // If we failed the logon, try to erase the password field.
     if (FAILED(HRESULT_FROM_NT(ntsStatus)))
     {
+        g_fAutoLogonInProgress = false; // Reset lock on logon failure
         if (_pCredProvCredentialEvents)
         {
             _pCredProvCredentialEvents->SetFieldString(this, SFI_PASSWORD, L"");
@@ -700,14 +665,34 @@ HRESULT CSampleCredential::GetFieldOptions(DWORD dwFieldID,
 
 HRESULT CSampleCredential::_StartHostProcess()
 {
+    // If auto-logon is currently in progress, skip launching host to prevent duplicate camera usage
+    if (g_fAutoLogonInProgress)
+    {
+        if (GetTickCount64() - g_llLastAuthSuccessTime < 15000) // 15s window
+        {
+            LogInfo(L"Auto-logon is in progress. Skipping helper process startup.");
+            return S_OK;
+        }
+        else
+        {
+            g_fAutoLogonInProgress = false;
+        }
+    }
+
     LogInfo(L"Starting FaceLogonHost helper process...");
+    _llCreationTime = GetTickCount64();
     
     // Stop any existing process first
     _StopHostProcess();
 
     // 1. Generate Nonce
-    BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceHi), sizeof(_sessionNonceHi), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceLo), sizeof(_sessionNonceLo), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    NTSTATUS statusHi = BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceHi), sizeof(_sessionNonceHi), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    NTSTATUS statusLo = BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&_sessionNonceLo), sizeof(_sessionNonceLo), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (statusHi != 0 || statusLo != 0) // STATUS_SUCCESS = 0
+    {
+        LogError(L"BCryptGenRandom failed to generate secure session nonce.");
+        return E_FAIL;
+    }
 
     wchar_t nonceHex[33];
     StringCchPrintfW(nonceHex, ARRAYSIZE(nonceHex), L"%016llx%016llx", _sessionNonceHi, _sessionNonceLo);
@@ -727,7 +712,7 @@ HRESULT CSampleCredential::_StartHostProcess()
 
     _hPipe = CreateNamedPipeW(
         pipeName,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         1,
         1024,
@@ -741,6 +726,15 @@ HRESULT CSampleCredential::_StartHostProcess()
     if (_hPipe == INVALID_HANDLE_VALUE)
     {
         LogError(L"CreateNamedPipeW failed: %lu", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    _hPipeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (_hPipeEvent == nullptr)
+    {
+        LogError(L"CreateEventW failed for _hPipeEvent: %lu", GetLastError());
+        CloseHandle(_hPipe);
+        _hPipe = INVALID_HANDLE_VALUE;
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
@@ -789,8 +783,11 @@ HRESULT CSampleCredential::_StartHostProcess()
     LogInfo(L"Launching helper host path: %ls", hostPath);
 
     // 5. Build Command Line arguments
+    AppConfig config = {};
+    LoadAppConfig(&config);
+
     wchar_t cmdLine[512];
-    StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine), L"\"%s\" --pipe \"%s\" --nonce %s", hostPath, pipeName, nonceHex);
+    StringCchPrintfW(cmdLine, ARRAYSIZE(cmdLine), L"\"%s\" --pipe \"%s\" --nonce %s --camera %d", hostPath, pipeName, nonceHex, config.cameraIndex);
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -831,6 +828,7 @@ HRESULT CSampleCredential::_StartHostProcess()
     }
 
     _fScanning = true;
+    _fFaceAuthSuccess = false;
 
     // 6. Start Named Pipe Read Thread
     _hPipeReadThread = CreateThread(nullptr, 0, _PipeReadThreadProc, this, 0, nullptr);
@@ -842,6 +840,12 @@ HRESULT CSampleCredential::_StartHostProcess()
 void CSampleCredential::_StopHostProcess()
 {
     _fScanning = false;
+
+    // Signal the thread to cancel
+    if (_hPipeEvent != nullptr)
+    {
+        SetEvent(_hPipeEvent);
+    }
 
     // 1. Terminate or Shutdown Host Process
     if (_hHostProcess != INVALID_HANDLE_VALUE)
@@ -864,7 +868,15 @@ void CSampleCredential::_StopHostProcess()
             header.sessionNonceLo = _sessionNonceLo;
 
             DWORD bytesWritten = 0;
-            WriteFile(_hPipe, &header, sizeof(header), &bytesWritten, nullptr);
+            OVERLAPPED writeOverlapped = {};
+            writeOverlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (writeOverlapped.hEvent != nullptr)
+            {
+                WriteFile(_hPipe, &header, sizeof(header), &bytesWritten, &writeOverlapped);
+                // Wait briefly for write to complete
+                WaitForSingleObject(writeOverlapped.hEvent, 50);
+                CloseHandle(writeOverlapped.hEvent);
+            }
         }
 
         // Force kill if necessary after brief delay, or just let Job Object handle it
@@ -880,10 +892,10 @@ void CSampleCredential::_StopHostProcess()
         _hHostJob = INVALID_HANDLE_VALUE;
     }
 
-    // 3. Close Named Pipe
+    // 3. Cancel and Close Named Pipe
     if (_hPipe != INVALID_HANDLE_VALUE)
     {
-        // Disconnect first to unblock any waiting thread
+        CancelIoEx(_hPipe, nullptr);
         DisconnectNamedPipe(_hPipe);
         CloseHandle(_hPipe);
         _hPipe = INVALID_HANDLE_VALUE;
@@ -897,6 +909,13 @@ void CSampleCredential::_StopHostProcess()
         _hPipeReadThread = INVALID_HANDLE_VALUE;
     }
 
+    // 5. Clean up pipe event
+    if (_hPipeEvent != nullptr)
+    {
+        CloseHandle(_hPipeEvent);
+        _hPipeEvent = nullptr;
+    }
+
     _sessionNonceHi = 0;
     _sessionNonceLo = 0;
 }
@@ -908,11 +927,63 @@ DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
 
     LogInfo(L"Pipe read thread started.");
 
-    // ConnectNamedPipe will block until client connects
-    BOOL connected = ConnectNamedPipe(pThis->_hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-    if (!connected)
+    HANDLE hConnectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hConnectEvent)
     {
-        LogError(L"ConnectNamedPipe failed: %lu", GetLastError());
+        LogError(L"Failed to create hConnectEvent: %lu", GetLastError());
+        return 0;
+    }
+
+    OVERLAPPED connectOverlapped = {};
+    connectOverlapped.hEvent = hConnectEvent;
+
+    // ConnectNamedPipe using overlapped I/O
+    BOOL connected = FALSE;
+    if (ConnectNamedPipe(pThis->_hPipe, &connectOverlapped))
+    {
+        connected = TRUE;
+    }
+    else
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_CONNECTED)
+        {
+            connected = TRUE;
+        }
+        else if (err == ERROR_IO_PENDING)
+        {
+            // Wait for connection or cancellation event
+            HANDLE waitHandles[2] = { hConnectEvent, pThis->_hPipeEvent };
+            DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+            if (waitRes == WAIT_OBJECT_0)
+            {
+                DWORD bytesTransferred = 0;
+                if (GetOverlappedResult(pThis->_hPipe, &connectOverlapped, &bytesTransferred, FALSE))
+                {
+                    connected = TRUE;
+                }
+                else
+                {
+                    LogError(L"GetOverlappedResult for ConnectNamedPipe failed: %lu", GetLastError());
+                }
+            }
+            else
+            {
+                LogInfo(L"ConnectNamedPipe wait canceled or pipe event signaled.");
+                CancelIoEx(pThis->_hPipe, &connectOverlapped);
+            }
+        }
+        else
+        {
+            LogError(L"ConnectNamedPipe failed: %lu", err);
+        }
+    }
+
+    CloseHandle(hConnectEvent);
+
+    if (!connected || !pThis->_fScanning)
+    {
+        LogInfo(L"Pipe connection not established or scanning stopped. Thread exiting.");
         return 0;
     }
 
@@ -927,18 +998,57 @@ DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
         uint64_t sessionNonceLo;
     };
 
+    HANDLE hReadEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hReadEvent)
+    {
+        LogError(L"Failed to create hReadEvent: %lu", GetLastError());
+        return 0;
+    }
+
+    OVERLAPPED readOverlapped = {};
+    readOverlapped.hEvent = hReadEvent;
+
     while (pThis->_fScanning)
     {
         MessageHeader header = {};
         DWORD bytesRead = 0;
-        BOOL ok = ReadFile(pThis->_hPipe, &header, sizeof(header), &bytesRead, nullptr);
-        if (!ok || bytesRead == 0)
+        ResetEvent(hReadEvent);
+        
+        BOOL ok = ReadFile(pThis->_hPipe, &header, sizeof(header), &bytesRead, &readOverlapped);
+        if (!ok)
         {
-            // Disconnect or error
-            break;
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING)
+            {
+                HANDLE waitHandles[2] = { hReadEvent, pThis->_hPipeEvent };
+                DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+                if (waitRes == WAIT_OBJECT_0)
+                {
+                    if (GetOverlappedResult(pThis->_hPipe, &readOverlapped, &bytesRead, FALSE))
+                    {
+                        ok = TRUE;
+                    }
+                    else
+                    {
+                        // Read failed
+                        break;
+                    }
+                }
+                else
+                {
+                    LogInfo(L"ReadFile wait canceled or pipe event signaled.");
+                    CancelIoEx(pThis->_hPipe, &readOverlapped);
+                    break;
+                }
+            }
+            else
+            {
+                // Other error
+                break;
+            }
         }
 
-        if (bytesRead == sizeof(header))
+        if (ok && bytesRead == sizeof(header))
         {
             if (header.magic == 0x4F4C4648 &&
                 header.sessionNonceHi == pThis->_sessionNonceHi &&
@@ -951,8 +1061,14 @@ DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
                 LogError(L"Received message with invalid magic or session nonce.");
             }
         }
+        else
+        {
+            // Incomplete read or error
+            break;
+        }
     }
 
+    CloseHandle(hReadEvent);
     LogInfo(L"Pipe read thread exiting.");
     return 0;
 }
@@ -966,6 +1082,24 @@ void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
         break;
     case 4: // MSG_MATCHED
         _UpdateStatusText(L"顔が一致しました。サインインしています...");
+        _fFaceAuthSuccess = true;
+        g_fAutoLogonInProgress = true;
+        g_llLastAuthSuccessTime = GetTickCount64();
+        if (_pProvider != nullptr)
+        {
+            // スリープ解除直後など、LogonUIが完全にアクティブ化する前に
+            // TriggerAutoLogon を呼び出すと無視されてハングする現象を防ぐため、
+            // ホストプロセス開始から最低 1200ms 経過するのを保証する。
+            ULONGLONG elapsed = GetTickCount64() - _llCreationTime;
+            const ULONGLONG TARGET_ACTIVE_DELAY = 1200;
+            if (elapsed < TARGET_ACTIVE_DELAY)
+            {
+                ULONGLONG sleepTime = TARGET_ACTIVE_DELAY - elapsed;
+                if (sleepTime > 1000) sleepTime = 1000;
+                Sleep(static_cast<DWORD>(sleepTime));
+            }
+            _pProvider->TriggerAutoLogon();
+        }
         break;
     case 5: // MSG_NO_MATCH
         _UpdateStatusText(L"登録された顔と一致しません");

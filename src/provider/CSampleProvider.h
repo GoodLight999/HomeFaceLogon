@@ -63,6 +63,26 @@ class CSampleProvider : public ICredentialProvider,
 
     IFACEMETHODIMP SetUserArray(_In_ ICredentialProviderUserArray *users);
 
+    void TriggerAutoLogon()
+    {
+        _fAutoLogon = true;
+        ForceCredentialsChanged();
+    }
+
+    void ResetAutoLogon()
+    {
+        _fAutoLogon = false;
+    }
+
+    HRESULT ForceCredentialsChanged()
+    {
+        if (_pcpe != nullptr)
+        {
+            return _pcpe->CredentialsChanged(_upAdviseContext);
+        }
+        return S_OK;
+    }
+
     friend HRESULT CSample_CreateInstance(_In_ REFIID riid, _Outptr_ void** ppv);
 
   protected:
@@ -82,4 +102,7 @@ private:
     CREDENTIAL_PROVIDER_USAGE_SCENARIO      _cpus;
     ICredentialProviderUserArray            *_pCredProviderUserArray;
 
+    ICredentialProviderEvents*              _pcpe;
+    UINT_PTR                                _upAdviseContext;
+    bool                                    _fAutoLogon;
 };

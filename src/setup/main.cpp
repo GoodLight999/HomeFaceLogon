@@ -9,14 +9,19 @@
 #include <filesystem>
 #include <memory>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 // OpenCV headers
 #include <opencv2/opencv.hpp>
 #include <opencv2/objdetect.hpp>
 #include <opencv2/dnn.hpp>
 
+#include <bcrypt.h>
+
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Bcrypt.lib")
 
 namespace fs = std::filesystem;
 
@@ -36,6 +41,163 @@ struct FaceFileHeader {
 
 const uint32_t HFLO_MAGIC = 0x4F4C4648;
 const uint32_t HFLF_MAGIC = 0x464C4648;
+
+static constexpr int kCameraWidth = 640;
+static constexpr int kCameraHeight = 480;
+
+// MSMF/DirectShow camera backends require COM on the thread that opens and
+// uses VideoCapture. Worker-thread camera init races with DNN model loading
+// and can deadlock during MFStartup/COM apartment setup.
+struct ComApartment
+{
+    HRESULT hr;
+
+    ComApartment() : hr(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ComApartment()
+    {
+        if (hr == S_OK)
+        {
+            CoUninitialize();
+        }
+    }
+
+    bool Ok() const
+    {
+        return SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    }
+};
+
+static void ConfigureCameraProperties(cv::VideoCapture& cap)
+{
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, kCameraWidth);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, kCameraHeight);
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+}
+
+static bool OpenCameraBackend(cv::VideoCapture& cap, int cameraIndex, bool allowFallback)
+{
+    std::cout << "Attempting to open camera index " << cameraIndex
+              << " using CAP_DSHOW (allowFallback="
+              << (allowFallback ? "true" : "false") << ")..." << std::endl;
+    cap.open(cameraIndex, cv::CAP_DSHOW);
+    if (!cap.isOpened() && allowFallback)
+    {
+        std::cout << "DirectShow failed, trying Media Foundation (CAP_MSMF)..." << std::endl;
+        cap.open(cameraIndex, cv::CAP_MSMF);
+    }
+    if (!cap.isOpened() && allowFallback)
+    {
+        std::cout << "Media Foundation failed, trying default backend..." << std::endl;
+        cap.open(cameraIndex);
+    }
+    return cap.isOpened();
+}
+
+static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayMs = 100)
+{
+    for (int attempt = 0; attempt < maxAttempts; ++attempt)
+    {
+        if (cap.grab())
+        {
+            return true;
+        }
+        Sleep(delayMs);
+    }
+    return false;
+}
+
+// USB cameras that were idle or in a power-saving state need time to resume before
+// DirectShow/MSMF can enumerate and stream. Retry open/warm-up instead of failing
+// the first verification or enrollment attempt.
+static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    const int MAX_RETRIES = 3;
+    const int RETRY_DELAY_MS = 500;
+
+    for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt)
+    {
+        const bool allowFallback = (attempt >= MAX_RETRIES - 1);
+        std::cout << "Attempting to open camera index " << cameraIndex
+                  << " (attempt " << attempt << "/" << MAX_RETRIES
+                  << ", allowFallback=" << (allowFallback ? "true" : "false") << ")..." << std::endl;
+
+        if (OpenCameraBackend(cap, cameraIndex, allowFallback))
+        {
+            ConfigureCameraProperties(cap);
+
+            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            if (width <= 0 || height <= 0)
+            {
+                width = kCameraWidth;
+                height = kCameraHeight;
+            }
+
+            // On early attempts use fewer warm-up polls so we fail fast and
+            // retry the full open cycle rather than blocking on a camera that
+            // is still re-enumerating after sleep/resume.
+            int warmAttempts = (attempt < MAX_RETRIES) ? 10 : 30;
+            if (WarmUpCamera(cap, warmAttempts))
+            {
+                std::cout << "Camera opened and streaming successfully ("
+                          << width << "x" << height << ")." << std::endl;
+                return true;
+            }
+
+            std::cout << "Camera opened but failed to stream frames after warm-up. Releasing for retry..." << std::endl;
+            cap.release();
+        }
+
+        if (attempt < MAX_RETRIES)
+        {
+            std::cout << "Camera device busy or resuming from power saving. Waiting "
+                      << RETRY_DELAY_MS << " ms before retry..." << std::endl;
+            Sleep(RETRY_DELAY_MS);
+        }
+    }
+
+    return false;
+}
+
+struct HostConfig {
+    double matchThreshold = 0.363;
+};
+
+static double ExtractDouble(const std::string& content, const std::string& key, double defaultValue)
+{
+    size_t pos = content.find("\"" + key + "\"");
+    if (pos == std::string::npos) return defaultValue;
+    pos = content.find(":", pos);
+    if (pos == std::string::npos) return defaultValue;
+    size_t valPos = content.find_first_not_of(" \t\r\n", pos + 1);
+    if (valPos == std::string::npos) return defaultValue;
+    try {
+        return std::stod(content.substr(valPos));
+    } catch(...) {
+        return defaultValue;
+    }
+}
+
+static bool LoadHostConfig(HostConfig& config)
+{
+    wchar_t path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    {
+        return false;
+    }
+    PathAppendW(path, L"HomeFaceLogon");
+    PathAppendW(path, L"config.json");
+
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+
+    config.matchThreshold = ExtractDouble(content, "matchThreshold", 0.363);
+    if (config.matchThreshold <= 0.0 || config.matchThreshold > 1.0) config.matchThreshold = 0.363;
+    return true;
+}
 
 std::string utf16_to_utf8(const std::wstring& wstr)
 {
@@ -137,6 +299,99 @@ bool SaveSecret(const std::wstring& password)
     return true;
 }
 
+struct PinFileHeader {
+    uint32_t magic;          // 'HFLP' (0x504C4648)
+    uint16_t schemaVersion;  // 1
+    uint16_t flags;          // 0
+    uint32_t iterations;     // PBKDF2 iterations
+    uint8_t  salt[16];       // Random salt
+};
+
+const uint32_t HFLP_MAGIC = 0x504C4648;
+const uint32_t PIN_HASH_SIZE = 32;
+
+bool SavePin(const std::wstring& pin)
+{
+    if (pin.empty()) return false;
+
+    // 1. Generate 16 bytes of random salt
+    PinFileHeader header = {};
+    header.magic = HFLP_MAGIC;
+    header.schemaVersion = 1;
+    header.flags = 0;
+    header.iterations = 100000; // PBKDF2 iterations
+
+    NTSTATUS status = BCryptGenRandom(nullptr, header.salt, sizeof(header.salt), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status))
+    {
+        std::wcerr << L"BCryptGenRandom failed: 0x" << std::hex << status << std::endl;
+        return false;
+    }
+
+    // 2. Convert PIN to UTF-8
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0) return false;
+
+    std::vector<char> pinUtf8(utf8Len);
+    WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1, pinUtf8.data(), utf8Len, nullptr, nullptr);
+    ULONG pinLen = static_cast<ULONG>(utf8Len - 1); // exclude null terminator
+
+    // 3. Derive key via PBKDF2-SHA256
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(status))
+    {
+        SecureZeroMemory(pinUtf8.data(), pinUtf8.size());
+        return false;
+    }
+
+    uint8_t derivedKey[PIN_HASH_SIZE];
+    status = BCryptDeriveKeyPBKDF2(
+        hAlg,
+        reinterpret_cast<PUCHAR>(pinUtf8.data()),
+        pinLen,
+        header.salt,
+        sizeof(header.salt),
+        header.iterations,
+        derivedKey,
+        PIN_HASH_SIZE,
+        0
+    );
+
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    SecureZeroMemory(pinUtf8.data(), pinUtf8.size());
+
+    if (!BCRYPT_SUCCESS(status))
+    {
+        std::wcerr << L"BCryptDeriveKeyPBKDF2 failed: 0x" << std::hex << status << std::endl;
+        return false;
+    }
+
+    // 4. Write to pin.bin
+    wchar_t path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    {
+        return false;
+    }
+    PathAppendW(path, L"HomeFaceLogon");
+    CreateDirectoryW(path, nullptr);
+    PathAppendW(path, L"pin.bin");
+
+    std::ofstream file(path, std::ios::out | std::ios::binary);
+    if (!file.is_open())
+    {
+        std::wcerr << L"Failed to open pin.bin for writing." << std::endl;
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(derivedKey), PIN_HASH_SIZE);
+    file.close();
+
+    SecureZeroMemory(derivedKey, sizeof(derivedKey));
+    return true;
+}
+
 bool SaveConfig(const std::wstring& sid)
 {
     wchar_t path[MAX_PATH];
@@ -162,7 +417,13 @@ bool SaveConfig(const std::wstring& sid)
     file << "{\n";
     file << "  \"schemaVersion\": 1,\n";
     file << "  \"enabled\": true,\n";
-    file << "  \"targetSid\": \"" << utf8Sid << "\"\n";
+    file << "  \"targetSid\": \"" << utf8Sid << "\",\n";
+    file << "  \"matchThreshold\": 0.363,\n";
+    file << "  \"requiredMatches\": 3,\n";
+    file << "  \"windowSize\": 5,\n";
+    file << "  \"scanTimeoutMs\": 10000,\n";
+    file << "  \"livenessEnabled\": false,\n";
+    file << "  \"cameraIndex\": 0\n";
     file << "}\n";
     file.close();
 
@@ -248,6 +509,13 @@ bool LoadFaceTemplate(std::vector<float>& featureVec)
         return false;
     }
 
+    if (header.protectedBlobSize > 65536)
+    {
+        std::wcerr << L"Invalid face.bin protected blob size." << std::endl;
+        file.close();
+        return false;
+    }
+
     std::vector<BYTE> encryptedBlob(header.protectedBlobSize);
     file.read(reinterpret_cast<char*>(encryptedBlob.data()), header.protectedBlobSize);
     file.close();
@@ -300,38 +568,43 @@ bool EnrollFace(int cameraIndex)
     std::string modelDet = utf16_to_utf8(wModelDet);
     std::string modelRec = utf16_to_utf8(wModelRec);
 
-    cv::VideoCapture cap(cameraIndex, cv::CAP_DSHOW);
-    if (!cap.isOpened())
+    ComApartment com;
+    if (!com.Ok())
     {
-        cap.open(cameraIndex);
-        if (!cap.isOpened())
-        {
-            std::wcerr << L"Error: Failed to open camera index " << cameraIndex << std::endl;
-            return false;
-        }
-    }
-
-    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    if (width <= 0 || height <= 0)
-    {
-        width = 640;
-        height = 480;
-    }
-
-    cv::Ptr<cv::FaceDetectorYN> detector;
-    try {
-        detector = cv::FaceDetectorYN::create(modelDet, "", cv::Size(width, height), 0.9f, 0.3f, 5000);
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error creating FaceDetectorYN: " << e.what() << std::endl;
+        std::wcerr << L"Error: Failed to initialize COM for camera access." << std::endl;
         return false;
     }
 
+    cv::VideoCapture cap;
+    cv::Ptr<cv::FaceDetectorYN> detector;
     cv::Ptr<cv::FaceRecognizerSF> recognizer;
-    try {
+    int width = kCameraWidth;
+    int height = kCameraHeight;
+    std::atomic<bool> modelsOk{false};
+
+    // Synchronous initialization to avoid COM and loader lock deadlocks.
+    try
+    {
+        detector = cv::FaceDetectorYN::create(
+            modelDet, "", cv::Size(kCameraWidth, kCameraHeight), 0.9f, 0.3f, 5000);
         recognizer = cv::FaceRecognizerSF::create(modelRec, "");
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error creating FaceRecognizerSF: " << e.what() << std::endl;
+        modelsOk = true;
+    }
+    catch (const cv::Exception& e)
+    {
+        std::cerr << "Error creating face models: " << e.what() << std::endl;
+    }
+
+    const bool cameraOk = OpenAndConfigureCamera(cap, cameraIndex, width, height);
+
+    if (!modelsOk)
+    {
+        return false;
+    }
+
+    if (!cameraOk)
+    {
+        std::wcerr << L"Error: Failed to open camera index " << cameraIndex << std::endl;
         return false;
     }
 
@@ -389,6 +662,14 @@ bool EnrollFace(int cameraIndex)
 
         cv::putText(frame, msg, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, boxColor, 2);
         cv::imshow("Face Enrollment - HomeFaceLogon", frame);
+
+        // Check if window was closed by user
+        if (cv::getWindowProperty("Face Enrollment - HomeFaceLogon", cv::WND_PROP_VISIBLE) < 1)
+        {
+            std::cout << "Enrollment cancelled by closing window." << std::endl;
+            cv::destroyAllWindows();
+            return false;
+        }
 
         if (cv::waitKey(1) == 27)
         {
@@ -463,45 +744,53 @@ bool VerifyFace(int cameraIndex)
     std::string modelDet = utf16_to_utf8(wModelDet);
     std::string modelRec = utf16_to_utf8(wModelRec);
 
-    cv::VideoCapture cap(cameraIndex, cv::CAP_DSHOW);
-    if (!cap.isOpened())
+    ComApartment com;
+    if (!com.Ok())
     {
-        cap.open(cameraIndex);
-        if (!cap.isOpened())
-        {
-            std::wcerr << L"Error: Failed to open camera index " << cameraIndex << std::endl;
-            return false;
-        }
+        std::wcerr << L"Error: Failed to initialize COM for camera access." << std::endl;
+        return false;
     }
 
-    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    if (width <= 0 || height <= 0)
-    {
-        width = 640;
-        height = 480;
-    }
-
+    cv::VideoCapture cap;
     cv::Ptr<cv::FaceDetectorYN> detector;
-    try {
-        detector = cv::FaceDetectorYN::create(modelDet, "", cv::Size(width, height), 0.9f, 0.3f, 5000);
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error creating FaceDetectorYN: " << e.what() << std::endl;
-        return false;
-    }
-
     cv::Ptr<cv::FaceRecognizerSF> recognizer;
-    try {
+    int width = kCameraWidth;
+    int height = kCameraHeight;
+    std::atomic<bool> modelsOk{false};
+
+    // Synchronous initialization to avoid COM and loader lock deadlocks.
+    try
+    {
+        detector = cv::FaceDetectorYN::create(
+            modelDet, "", cv::Size(kCameraWidth, kCameraHeight), 0.9f, 0.3f, 5000);
         recognizer = cv::FaceRecognizerSF::create(modelRec, "");
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error creating FaceRecognizerSF: " << e.what() << std::endl;
+        modelsOk = true;
+    }
+    catch (const cv::Exception& e)
+    {
+        std::cerr << "Error creating face models: " << e.what() << std::endl;
+    }
+
+    const bool cameraOk = OpenAndConfigureCamera(cap, cameraIndex, width, height);
+
+    if (!modelsOk)
+    {
         return false;
     }
 
-    std::cout << "Starting Face Verification. Press ESC to stop." << std::endl;
+    if (!cameraOk)
+    {
+        std::wcerr << L"Error: Failed to open camera index " << cameraIndex << std::endl;
+        return false;
+    }
+
+    HostConfig config;
+    LoadHostConfig(config);
+    std::cout << "Starting Face Verification (threshold=" << config.matchThreshold << "). Press ESC to stop." << std::endl;
 
     cv::Mat frame;
-    const double MATCH_THRESHOLD = 0.363; // SFace Cosine Similarity threshold
+    int matchCount = 0;
+    bool verifySuccess = false;
 
     while (true)
     {
@@ -527,7 +816,12 @@ bool VerifyFace(int cameraIndex)
 
                 double score = recognizer->match(feature, templateFeature, cv::FaceRecognizerSF::DisType::FR_COSINE);
 
-                bool isMatch = score >= MATCH_THRESHOLD;
+                bool isMatch = score >= config.matchThreshold;
+                if (isMatch)
+                {
+                    matchCount++;
+                }
+
                 cv::Scalar boxColor = isMatch ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
 
                 int x = static_cast<int>(faces.at<float>(i, 0));
@@ -543,14 +837,31 @@ bool VerifyFace(int cameraIndex)
 
         cv::imshow("Face Verification - HomeFaceLogon", frame);
 
+        // Auto close on 3 matches
+        if (matchCount >= 3)
+        {
+            std::cout << "Verification successful. Match count threshold reached." << std::endl;
+            verifySuccess = true;
+            cv::waitKey(1000); // Show result for 1 second
+            break;
+        }
+
+        // Check if window was closed
+        if (cv::getWindowProperty("Face Verification - HomeFaceLogon", cv::WND_PROP_VISIBLE) < 1)
+        {
+            std::cout << "Verification stopped by closing window." << std::endl;
+            break;
+        }
+
         if (cv::waitKey(1) == 27)
         {
+            std::cout << "Verification cancelled by user." << std::endl;
             break;
         }
     }
 
     cv::destroyAllWindows();
-    return true;
+    return verifySuccess;
 }
 
 bool RunDiagnostics()
@@ -696,6 +1007,7 @@ int wmain(int argc, wchar_t* argv[])
 {
     std::wstring sid;
     std::wstring password;
+    std::wstring pin;
     bool enroll = false;
     bool verify = false;
     bool test = false;
@@ -706,10 +1018,6 @@ int wmain(int argc, wchar_t* argv[])
         if (_wcsicmp(argv[i], L"--sid") == 0 && i + 1 < argc)
         {
             sid = argv[++i];
-        }
-        else if (_wcsicmp(argv[i], L"--password") == 0 && i + 1 < argc)
-        {
-            password = argv[++i];
         }
         else if (_wcsicmp(argv[i], L"--enroll") == 0)
         {
@@ -747,33 +1055,100 @@ int wmain(int argc, wchar_t* argv[])
     if (sid.empty())
     {
         std::wcout << L"Enter Target Windows User SID: ";
-        std::wcin >> sid;
+        std::getline(std::wcin, sid);
+        if (!sid.empty() && sid.back() == L'\r')
+        {
+            sid.pop_back();
+        }
     }
 
     if (password.empty())
     {
-        std::wcout << L"Enter Microsoft Account Password: ";
         HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
         DWORD mode;
-        GetConsoleMode(hStdin, &mode);
-        SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT));
+        BOOL isConsole = GetConsoleMode(hStdin, &mode);
+        if (isConsole)
+        {
+            std::wcout << L"Enter Microsoft Account Password: ";
+            SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT));
+        }
         
-        std::wcin >> password;
+        std::getline(std::wcin, password);
+        if (!password.empty() && password.back() == L'\r')
+        {
+            password.pop_back();
+        }
         
-        SetConsoleMode(hStdin, mode);
-        std::wcout << std::endl;
+        if (isConsole)
+        {
+            SetConsoleMode(hStdin, mode);
+            std::wcout << std::endl;
+        }
     }
 
-    if (sid.empty() || password.empty())
+    if (pin.empty())
     {
-        std::wcerr << L"Error: SID and Password cannot be empty." << std::endl;
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD mode;
+        BOOL isConsole = GetConsoleMode(hStdin, &mode);
+        if (isConsole)
+        {
+            std::wcout << L"Enter Local PIN (4-16 digits for fallback): ";
+            SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT));
+        }
+        
+        std::getline(std::wcin, pin);
+        if (!pin.empty() && pin.back() == L'\r')
+        {
+            pin.pop_back();
+        }
+        
+        if (isConsole)
+        {
+            SetConsoleMode(hStdin, mode);
+            std::wcout << std::endl;
+        }
+    }
+
+    if (sid.empty() || password.empty() || pin.empty())
+    {
+        std::wcerr << L"Error: SID, Password, and PIN cannot be empty." << std::endl;
         return 1;
     }
+
+    // PIN complexity check: 4 to 16 characters (ASCII printable, no spaces)
+    if (pin.length() < 4 || pin.length() > 16)
+    {
+        std::wcerr << L"Error: PIN must be between 4 and 16 characters." << std::endl;
+        SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+        SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
+        return 1;
+    }
+    for (wchar_t c : pin)
+    {
+        if (c < 33 || c > 126)
+        {
+            std::wcerr << L"Error: PIN must contain only alphanumeric characters and symbols (no spaces)." << std::endl;
+            SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+            SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
+            return 1;
+        }
+    }
+
 
     if (!SaveSecret(password))
     {
         std::wcerr << L"Failed to save encrypted secret." << std::endl;
         SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+        SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
+        return 1;
+    }
+
+    if (!SavePin(pin))
+    {
+        std::wcerr << L"Failed to save PIN." << std::endl;
+        SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+        SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
         return 1;
     }
 
@@ -781,11 +1156,13 @@ int wmain(int argc, wchar_t* argv[])
     {
         std::wcerr << L"Failed to save configuration." << std::endl;
         SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+        SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
         return 1;
     }
 
     SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
+    SecureZeroMemory(&pin[0], pin.length() * sizeof(wchar_t));
 
-    std::wcout << L"Setup completed successfully. targetSid and secret.bin updated." << std::endl;
+    std::wcout << L"Setup completed successfully. targetSid, secret.bin, and pin.bin updated." << std::endl;
     return 0;
 }

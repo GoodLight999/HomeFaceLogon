@@ -67,12 +67,15 @@ $acl = Get-Acl -Path $dataDir
 $acl.SetAccessRuleProtection($true, $false)
 $systemSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
 $adminsSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+$authUsersSid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::AuthenticatedUserSid, $null)
 
 $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow")
 $adminsRule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow")
+$authUsersRule = New-Object System.Security.AccessControl.FileSystemAccessRule($authUsersSid, "ReadAndExecute", "ContainerInherit, ObjectInherit", "None", "Allow")
 
 $acl.AddAccessRule($systemRule)
 $acl.AddAccessRule($adminsRule)
+$acl.AddAccessRule($authUsersRule)
 Set-Acl -Path $dataDir -AclObject $acl
 
 # 5. Register COM CLSID
