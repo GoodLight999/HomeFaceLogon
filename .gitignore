@@ -185,3 +185,11 @@ Thumbs.db
 # Third-party dependencies
 # ----------------------------------------------------------------------
 /third_party/
+
+# ----------------------------------------------------------------------
+# Antigravity AI agent artifacts and build outputs
+# ----------------------------------------------------------------------
+/agent-tools/
+/walkthrough.md
+/installer_output/
+
