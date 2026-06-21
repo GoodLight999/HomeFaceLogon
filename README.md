@@ -15,6 +15,7 @@ A Windows 11 x64 Credential Provider and background host system that enables fac
 > - **WANT REAL SECURITY? BUY A WINDOWS HELLO COMPATIBLE IR CAMERA.**
 > - **Credentials Wrapper:** This tool is not a low-level authentication replacement. It is a convenience helper that decrypts and submits your local account password (secured via DPAPI) when a face match is detected.
 > - **No Hiding of Defaults:** It does not disable or hide standard Windows sign-in options (PIN/Password).
+> - **NO WARRANTY OF ANY KIND:** This software is provided "as-is" without warranty of any kind, either expressed or implied. Use at your own risk.
 
 ## 👁️ Features
 
@@ -177,6 +178,7 @@ If the login screen freezes or behaves incorrectly, you can bypass the provider:
 > - **真面目なセキュリティが欲しければ、Windows Hello対応のIRカメラをご購入ください。**
 > - **資格情報のラッパー:** 本ツールはWindows Helloのような低レベルの認証機構自体を置き換えるものではありません。顔一致を検知した際に、安全に保管されたパスワード（DPAPI保護）を自動的に復号してサインインを代行する支援ユーティリティです。
 > - **標準機能の維持:** Windows 標準のサインインオプション（パスワード/PIN）を無効化したり隠したりすることはありません。
+> - **品質および無保証について:** 本ソフトウェアは無保証（品質保証なし、完全自己責任）で提供されます。本ソフトウェアを使用したことによる不具合、データ損失、その他いかなる直接的・間接的不利益に対しても、作者は一切の責任を負いません。
 
 ## 👁️ 主な機能
 
