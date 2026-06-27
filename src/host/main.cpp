@@ -438,6 +438,58 @@ static bool OpenCameraBackend(cv::VideoCapture& cap, int cameraIndex, bool allow
     return cap.isOpened();
 }
 
+// Opens the camera on a worker thread with a hard timeout.
+// If OpenCameraBackend blocks longer than timeoutMs (e.g. due to USB resume after
+// sleep), the worker thread is detached and a fresh VideoCapture is used for the
+// next retry.  This prevents the entire host from being stuck for hours.
+static bool OpenCameraWithTimeout(cv::VideoCapture& cap, int cameraIndex,
+                                  bool allowFallback, DWORD timeoutMs = 3000)
+{
+    // Shared state between main thread and worker.
+    auto pCap = std::make_shared<cv::VideoCapture>();
+    auto pDone = std::make_shared<std::atomic<bool>>(false);
+    auto pResult = std::make_shared<std::atomic<bool>>(false);
+
+    std::thread worker([pCap, cameraIndex, allowFallback, pDone, pResult]()
+    {
+        ComApartment com;
+        if (!com.Ok())
+        {
+            HostLog("ERROR", "Worker thread: COM init failed.");
+            pDone->store(true);
+            return;
+        }
+        bool ok = OpenCameraBackend(*pCap, cameraIndex, allowFallback);
+        pResult->store(ok);
+        pDone->store(true);
+    });
+
+    // Wait for the worker to finish, but only up to timeoutMs.
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (!pDone->load())
+    {
+        if (GetTickCount64() >= deadline)
+        {
+            HostLog("WARNING", "Camera open timed out after %lu ms. Abandoning blocked worker thread.", timeoutMs);
+            // Detach the worker – it will eventually finish (or not) on its own.
+            // The shared_ptrs will keep the VideoCapture alive until the worker exits.
+            worker.detach();
+            return false;
+        }
+        Sleep(50);
+    }
+
+    worker.join();
+
+    if (pResult->load())
+    {
+        // Move the successfully opened capture object back to the caller.
+        cap = std::move(*pCap);
+        return true;
+    }
+    return false;
+}
+
 static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayMs = 100)
 {
     ULONGLONG warmupStart = GetTickCount64();
@@ -457,10 +509,13 @@ static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayM
 // USB cameras that were idle or in a power-saving state need time to resume before
 // DirectShow/MSMF can enumerate and stream. Retry open/warm-up instead of failing
 // the first sign-in scan attempt.
+// Each open attempt is guarded by a 3-second timeout to prevent blocking for hours
+// when DirectShow stalls on sleep/resume.
 static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
 {
-    const int MAX_RETRIES = 3;
+    const int MAX_RETRIES = 5;
     const int RETRY_DELAY_MS = 500;
+    const DWORD OPEN_TIMEOUT_MS = 3000;
 
     for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt)
     {
@@ -468,7 +523,7 @@ static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& wid
         HostLog("INFO", "Attempting to open camera index %d (attempt %d/%d, allowFallback=%s)...",
                 cameraIndex, attempt, MAX_RETRIES, allowFallback ? "true" : "false");
 
-        if (OpenCameraBackend(cap, cameraIndex, allowFallback))
+        if (OpenCameraWithTimeout(cap, cameraIndex, allowFallback, OPEN_TIMEOUT_MS))
         {
             ConfigureCameraProperties(cap);
 

@@ -904,7 +904,7 @@ void CSampleCredential::_StopHostProcess()
     // 4. Wait for Read Thread
     if (_hPipeReadThread != INVALID_HANDLE_VALUE)
     {
-        WaitForSingleObject(_hPipeReadThread, 1000);
+        WaitForSingleObject(_hPipeReadThread, 200);
         CloseHandle(_hPipeReadThread);
         _hPipeReadThread = INVALID_HANDLE_VALUE;
     }
