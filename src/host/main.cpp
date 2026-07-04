@@ -413,83 +413,6 @@ static void ConfigureCameraProperties(cv::VideoCapture& cap)
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
 }
 
-static bool OpenCameraBackend(cv::VideoCapture& cap, int cameraIndex, bool allowFallback)
-{
-    ULONGLONG backendStart = GetTickCount64();
-    HostLog("INFO", "Attempting to open camera index %d using CAP_DSHOW (allowFallback=%s)...",
-            cameraIndex, allowFallback ? "true" : "false");
-    cap.open(cameraIndex, cv::CAP_DSHOW);
-    HostLog("INFO", "CAP_DSHOW open finished: opened=%d, elapsed=%llums", cap.isOpened(), GetTickCount64() - backendStart);
-
-    if (!cap.isOpened() && allowFallback)
-    {
-        backendStart = GetTickCount64();
-        HostLog("INFO", "DirectShow failed, trying Media Foundation (CAP_MSMF)...");
-        cap.open(cameraIndex, cv::CAP_MSMF);
-        HostLog("INFO", "CAP_MSMF open finished: opened=%d, elapsed=%llums", cap.isOpened(), GetTickCount64() - backendStart);
-    }
-    if (!cap.isOpened() && allowFallback)
-    {
-        backendStart = GetTickCount64();
-        HostLog("INFO", "Media Foundation failed, trying default backend...");
-        cap.open(cameraIndex);
-        HostLog("INFO", "Default backend open finished: opened=%d, elapsed=%llums", cap.isOpened(), GetTickCount64() - backendStart);
-    }
-    return cap.isOpened();
-}
-
-// Opens the camera on a worker thread with a hard timeout.
-// If OpenCameraBackend blocks longer than timeoutMs (e.g. due to USB resume after
-// sleep), the worker thread is detached and a fresh VideoCapture is used for the
-// next retry.  This prevents the entire host from being stuck for hours.
-static bool OpenCameraWithTimeout(cv::VideoCapture& cap, int cameraIndex,
-                                  bool allowFallback, DWORD timeoutMs = 3000)
-{
-    // Shared state between main thread and worker.
-    auto pCap = std::make_shared<cv::VideoCapture>();
-    auto pDone = std::make_shared<std::atomic<bool>>(false);
-    auto pResult = std::make_shared<std::atomic<bool>>(false);
-
-    std::thread worker([pCap, cameraIndex, allowFallback, pDone, pResult]()
-    {
-        ComApartment com;
-        if (!com.Ok())
-        {
-            HostLog("ERROR", "Worker thread: COM init failed.");
-            pDone->store(true);
-            return;
-        }
-        bool ok = OpenCameraBackend(*pCap, cameraIndex, allowFallback);
-        pResult->store(ok);
-        pDone->store(true);
-    });
-
-    // Wait for the worker to finish, but only up to timeoutMs.
-    ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    while (!pDone->load())
-    {
-        if (GetTickCount64() >= deadline)
-        {
-            HostLog("WARNING", "Camera open timed out after %lu ms. Abandoning blocked worker thread.", timeoutMs);
-            // Detach the worker – it will eventually finish (or not) on its own.
-            // The shared_ptrs will keep the VideoCapture alive until the worker exits.
-            worker.detach();
-            return false;
-        }
-        Sleep(50);
-    }
-
-    worker.join();
-
-    if (pResult->load())
-    {
-        // Move the successfully opened capture object back to the caller.
-        cap = std::move(*pCap);
-        return true;
-    }
-    return false;
-}
-
 static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayMs = 100)
 {
     ULONGLONG warmupStart = GetTickCount64();
@@ -506,16 +429,35 @@ static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayM
     return false;
 }
 
-// USB cameras that were idle or in a power-saving state need time to resume before
-// DirectShow/MSMF can enumerate and stream. Retry open/warm-up instead of failing
-// the first sign-in scan attempt.
-// Each open attempt is guarded by a 3-second timeout to prevent blocking for hours
-// when DirectShow stalls on sleep/resume.
-static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+// Camera open and retry logic runs entirely on a single worker thread to avoid
+// DirectShow device lock contention.  The main thread waits for the result with
+// a hard overall timeout.
+//
+// Previous design (v0.3.0) spawned a new worker per retry attempt and detached
+// timed-out threads.  Detached threads held the camera device lock, causing ALL
+// subsequent retry workers to also time out.  This new design ensures only one
+// thread ever touches the camera at any given time.
+struct CameraOpenResult
 {
+    cv::VideoCapture cap;
+    int width = 0;
+    int height = 0;
+    bool success = false;
+};
+
+static void CameraWorkerThread(int cameraIndex, std::shared_ptr<CameraOpenResult> result,
+                               std::shared_ptr<std::atomic<bool>> done)
+{
+    ComApartment com;
+    if (!com.Ok())
+    {
+        HostLog("ERROR", "Camera worker: COM init failed.");
+        done->store(true);
+        return;
+    }
+
     const int MAX_RETRIES = 5;
-    const int RETRY_DELAY_MS = 500;
-    const DWORD OPEN_TIMEOUT_MS = 3000;
+    const int RETRY_DELAY_MS = 1000;
 
     for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt)
     {
@@ -523,39 +465,114 @@ static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& wid
         HostLog("INFO", "Attempting to open camera index %d (attempt %d/%d, allowFallback=%s)...",
                 cameraIndex, attempt, MAX_RETRIES, allowFallback ? "true" : "false");
 
-        if (OpenCameraWithTimeout(cap, cameraIndex, allowFallback, OPEN_TIMEOUT_MS))
+        ULONGLONG backendStart = GetTickCount64();
+
+        // Try DirectShow first (usually fastest)
+        HostLog("INFO", "Attempting to open camera index %d using CAP_DSHOW (allowFallback=%s)...",
+                cameraIndex, allowFallback ? "true" : "false");
+        result->cap.open(cameraIndex, cv::CAP_DSHOW);
+        ULONGLONG elapsed = GetTickCount64() - backendStart;
+        HostLog("INFO", "CAP_DSHOW open finished: opened=%d, elapsed=%llums",
+                result->cap.isOpened(), elapsed);
+
+        // Fallback to MSMF if DirectShow failed
+        if (!result->cap.isOpened() && allowFallback)
         {
-            ConfigureCameraProperties(cap);
+            backendStart = GetTickCount64();
+            HostLog("INFO", "DirectShow failed, trying Media Foundation (CAP_MSMF)...");
+            result->cap.open(cameraIndex, cv::CAP_MSMF);
+            HostLog("INFO", "CAP_MSMF open finished: opened=%d, elapsed=%llums",
+                    result->cap.isOpened(), GetTickCount64() - backendStart);
+        }
 
-            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-            if (width <= 0 || height <= 0)
+        // Fallback to default backend
+        if (!result->cap.isOpened() && allowFallback)
+        {
+            backendStart = GetTickCount64();
+            HostLog("INFO", "Media Foundation failed, trying default backend...");
+            result->cap.open(cameraIndex);
+            HostLog("INFO", "Default backend open finished: opened=%d, elapsed=%llums",
+                    result->cap.isOpened(), GetTickCount64() - backendStart);
+        }
+
+        if (result->cap.isOpened())
+        {
+            ConfigureCameraProperties(result->cap);
+
+            result->width = static_cast<int>(result->cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            result->height = static_cast<int>(result->cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            if (result->width <= 0 || result->height <= 0)
             {
-                width = kCameraWidth;
-                height = kCameraHeight;
+                result->width = kCameraWidth;
+                result->height = kCameraHeight;
             }
 
-            // On early attempts use fewer warm-up polls so we fail fast and
-            // retry the full open cycle rather than blocking on a camera that
-            // is still re-enumerating after sleep/resume.
             int warmAttempts = (attempt < MAX_RETRIES) ? 10 : 30;
-            if (WarmUpCamera(cap, warmAttempts))
+            if (WarmUpCamera(result->cap, warmAttempts))
             {
-                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).", width, height);
-                return true;
+                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).",
+                        result->width, result->height);
+                result->success = true;
+                done->store(true);
+                return;
             }
 
-            HostLog("WARNING", "Camera opened but failed to stream frames after warm-up. Releasing for retry...");
-            cap.release();
+            HostLog("WARNING", "Camera opened but warm-up failed. Releasing for retry...");
+            result->cap.release();
         }
 
         if (attempt < MAX_RETRIES)
         {
-            HostLog("INFO", "Camera device busy or resuming. Waiting %d ms before retry...", RETRY_DELAY_MS);
+            HostLog("INFO", "Camera device busy or resuming. Waiting %d ms before retry...",
+                    RETRY_DELAY_MS);
             Sleep(RETRY_DELAY_MS);
         }
     }
 
+    HostLog("ERROR", "Failed to open camera device after all retries.");
+    done->store(true);
+}
+
+// Opens the camera using a single dedicated worker thread.
+// The main thread polls for completion with an overall timeout.
+// If the worker exceeds the timeout (e.g. DirectShow blocked during sleep resume),
+// the main thread gives up but the worker will continue in the background.
+// Crucially, only ONE thread ever attempts camera open, avoiding device lock contention.
+static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    // Overall timeout: generous enough for retries, but bounded.
+    const DWORD OVERALL_TIMEOUT_MS = 25000;
+
+    auto result = std::make_shared<CameraOpenResult>();
+    auto done = std::make_shared<std::atomic<bool>>(false);
+
+    std::thread worker(CameraWorkerThread, cameraIndex, result, done);
+
+    ULONGLONG deadline = GetTickCount64() + OVERALL_TIMEOUT_MS;
+    while (!done->load())
+    {
+        if (GetTickCount64() >= deadline)
+        {
+            HostLog("WARNING", "Camera open overall timeout (%lu ms). Worker thread still running.",
+                    OVERALL_TIMEOUT_MS);
+            // Don't detach - join to ensure clean resource release.
+            // The worker will finish eventually (DirectShow returns after driver re-init).
+            // But we can't wait forever, so detach only as last resort.
+            worker.detach();
+            return false;
+        }
+        Sleep(100);
+    }
+
+    worker.join();
+
+    if (result->success)
+    {
+        cap = std::move(result->cap);
+        width = result->width;
+        height = result->height;
+        return true;
+    }
     return false;
 }
 
