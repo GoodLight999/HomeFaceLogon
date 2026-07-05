@@ -682,6 +682,9 @@ HRESULT CSampleCredential::_StartHostProcess()
     LogInfo(L"Starting FaceLogonHost helper process...");
     _llCreationTime = GetTickCount64();
     
+    // Reset status text to clear any stale error from previous run
+    _UpdateStatusText(L"カメラの準備中...");
+
     // Stop any existing process first
     _StopHostProcess();
 

@@ -4,12 +4,12 @@
 
 [Setup]
 AppName=HomeFaceLogon
-AppVersion=0.3.1
+AppVersion=0.3.2
 AppPublisher=HomeFaceLogon Team
 DefaultDirName={commonpf}\HomeFaceLogon
 DefaultGroupName=HomeFaceLogon
 OutputDir=..\installer_output
-OutputBaseFilename=HomeFaceLogonSetup-v0.3.1
+OutputBaseFilename=HomeFaceLogonSetup-v0.3.2
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64

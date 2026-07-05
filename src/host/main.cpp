@@ -813,6 +813,12 @@ int main(int argc, char* argv[])
     std::vector<bool> matchHistory;
     matchHistory.reserve(static_cast<size_t>(config.windowSize));
 
+    // CLAHE (Contrast Limited Adaptive Histogram Equalization) normalizes
+    // illumination before face recognition, making scores much more stable
+    // under varying lighting conditions (desk lamp, window light, night, etc.).
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    HostLog("INFO", "CLAHE illumination normalizer initialized (clipLimit=2.0, tileGrid=8x8).");
+
     HostLog("INFO", "Starting main capture and recognition loop...");
     while (g_running && cameraOk)
     {
@@ -870,20 +876,34 @@ int main(int argc, char* argv[])
 
         if (!config.livenessEnabled || motionDetected)
         {
-            cv::Mat faces;
-            if (lastDetectorInputSize != frame.size())
+            // Apply CLAHE illumination normalization before face detection/recognition.
+            // Convert BGR -> LAB, equalize L channel, convert back.
+            // This makes recognition scores much more stable under varying lighting.
+            cv::Mat normalizedFrame;
             {
-                detector->setInputSize(frame.size());
-                lastDetectorInputSize = frame.size();
+                cv::Mat lab;
+                cv::cvtColor(frame, lab, cv::COLOR_BGR2Lab);
+                std::vector<cv::Mat> labChannels;
+                cv::split(lab, labChannels);
+                clahe->apply(labChannels[0], labChannels[0]);
+                cv::merge(labChannels, lab);
+                cv::cvtColor(lab, normalizedFrame, cv::COLOR_Lab2BGR);
             }
-            detector->detect(frame, faces);
+
+            cv::Mat faces;
+            if (lastDetectorInputSize != normalizedFrame.size())
+            {
+                detector->setInputSize(normalizedFrame.size());
+                lastDetectorInputSize = normalizedFrame.size();
+            }
+            detector->detect(normalizedFrame, faces);
 
             if (faces.rows > 0)
             {
                 for (int i = 0; i < faces.rows; ++i)
                 {
                     cv::Mat aligned;
-                    recognizer->alignCrop(frame, faces.row(i), aligned);
+                    recognizer->alignCrop(normalizedFrame, faces.row(i), aligned);
                     cv::Mat feature;
                     recognizer->feature(aligned, feature);
 
@@ -893,6 +913,12 @@ int main(int argc, char* argv[])
                         HostLog("INFO", "Frame %d: Face[%d] matched (score=%f >= threshold=%f)", framesCount, i, score, config.matchThreshold);
                         frameMatched = true;
                         break;
+                    }
+                    else
+                    {
+                        // Log near-misses to help diagnose threshold tuning
+                        HostLog("INFO", "Frame %d: Face[%d] below threshold (score=%f < threshold=%f)",
+                                framesCount, i, score, config.matchThreshold);
                     }
                 }
             }
