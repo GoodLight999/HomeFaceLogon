@@ -535,33 +535,55 @@ static void CameraWorkerThread(int cameraIndex, std::shared_ptr<CameraOpenResult
 
 // Opens the camera using a single dedicated worker thread.
 // The main thread polls for completion with an overall timeout.
-// If the worker exceeds the timeout (e.g. DirectShow blocked during sleep resume),
-// the main thread gives up but the worker will continue in the background.
-// Crucially, only ONE thread ever attempts camera open, avoiding device lock contention.
+//
+// IMPORTANT: We cannot use a simple GetTickCount64() deadline because the tick
+// counter keeps running during sleep/hibernate.  If the system sleeps for hours,
+// the deadline would have already passed on resume, causing instant false timeout.
+// Instead we accumulate only "awake" elapsed time between polls.  Any gap larger
+// than 2 seconds between consecutive polls is assumed to be a sleep interval and
+// is excluded from the elapsed total.
 static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
 {
-    // Overall timeout: generous enough for retries, but bounded.
     const DWORD OVERALL_TIMEOUT_MS = 25000;
+    const DWORD POLL_INTERVAL_MS = 100;
+    // Any single poll gap larger than this is assumed to be a sleep/resume event.
+    const DWORD SLEEP_GAP_THRESHOLD_MS = 2000;
 
     auto result = std::make_shared<CameraOpenResult>();
     auto done = std::make_shared<std::atomic<bool>>(false);
 
     std::thread worker(CameraWorkerThread, cameraIndex, result, done);
 
-    ULONGLONG deadline = GetTickCount64() + OVERALL_TIMEOUT_MS;
+    ULONGLONG awakeElapsedMs = 0;
+    ULONGLONG lastPollTick = GetTickCount64();
+
     while (!done->load())
     {
-        if (GetTickCount64() >= deadline)
+        Sleep(POLL_INTERVAL_MS);
+
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG gap = now - lastPollTick;
+        lastPollTick = now;
+
+        if (gap < SLEEP_GAP_THRESHOLD_MS)
         {
-            HostLog("WARNING", "Camera open overall timeout (%lu ms). Worker thread still running.",
+            awakeElapsedMs += gap;
+        }
+        else
+        {
+            // Large gap detected — system likely resumed from sleep.
+            // Reset elapsed time so the worker gets a fresh chance.
+            HostLog("INFO", "Sleep/resume detected (gap=%llums). Resetting camera timeout.", gap);
+            awakeElapsedMs = 0;
+        }
+
+        if (awakeElapsedMs >= OVERALL_TIMEOUT_MS)
+        {
+            HostLog("WARNING", "Camera open overall timeout (%lu ms awake time). Worker thread still running.",
                     OVERALL_TIMEOUT_MS);
-            // Don't detach - join to ensure clean resource release.
-            // The worker will finish eventually (DirectShow returns after driver re-init).
-            // But we can't wait forever, so detach only as last resort.
             worker.detach();
             return false;
         }
-        Sleep(100);
     }
 
     worker.join();
