@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - agent/camera-recovery-setup-transaction
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -18,7 +21,7 @@ jobs:
       - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: agent/camera-recovery-setup-transaction
+          ref: ${{ github.head_ref || 'agent/camera-recovery-setup-transaction' }}
           fetch-depth: 0
 
       - name: Assemble and apply source patch
@@ -34,7 +37,9 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add src installer tools/apply-camera-recovery-fix.py
             git commit -m "fix: recover camera lifecycle and transactional setup"
-            git push origin HEAD:agent/camera-recovery-setup-transaction
+            if ($env:GITHUB_EVENT_NAME -eq 'push') {
+              git push origin HEAD:agent/camera-recovery-setup-transaction
+            }
           } else {
             Write-Host "Patch already applied; continuing with build."
           }
