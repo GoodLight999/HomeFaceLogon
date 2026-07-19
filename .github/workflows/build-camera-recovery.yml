@@ -1,0 +1,93 @@
+name: Build camera recovery installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/camera-recovery-setup-transaction
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/camera-recovery-setup-transaction
+          fetch-depth: 0
+
+      - name: Assemble and apply source patch
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem tools/camera_fix_parts/part-* | Sort-Object Name
+          $content = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          Set-Content -Path tools/apply-camera-recovery-fix.py -Value $content -Encoding utf8NoBOM
+          python -m py_compile tools/apply-camera-recovery-fix.py
+          if (Select-String -Path src/host/main.cpp -Pattern 'struct CameraOpenResult' -Quiet) {
+            python tools/apply-camera-recovery-fix.py
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src installer tools/apply-camera-recovery-fix.py
+            git commit -m "fix: recover camera lifecycle and transactional setup"
+            git push origin HEAD:agent/camera-recovery-setup-transaction
+          } else {
+            Write-Host "Patch already applied; continuing with build."
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/gui/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Download OpenCV and face models
+        shell: pwsh
+        run: |
+          ./tools/fetch-opencv.ps1
+          ./tools/fetch-models.ps1
+
+      - name: Build C++ Release x64
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild HomeFaceLogon.sln /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Tauri manager
+        shell: pwsh
+        working-directory: src/gui
+        run: |
+          npm install
+          npm run tauri build -- --no-bundle
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\iscc.exe')) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build installer EXE
+        shell: pwsh
+        run: ./tools/build-installer.ps1
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: HomeFaceLogon-v0.3.4-camera-recovery
+          path: installer_output/*.exe
+          if-no-files-found: error
+          retention-days: 30
