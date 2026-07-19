@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def read(rel):
+    return (ROOT / rel).read_text(encoding='utf-8')
+
+def write(rel, text):
+    (ROOT / rel).write_text(text, encoding='utf-8', newline='\n')
+
+def replace_once(text, old, new, label):
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f'{label}: expected one match, found {count}')
+    return text.replace(old, new, 1)
+
+def replace_span(text, start, end, replacement, label):
+    i = text.find(start)
+    if i < 0:
+        raise RuntimeError(f'{label}: start not found')
+    j = text.find(end, i)
+    if j < 0:
+        raise RuntimeError(f'{label}: end not found')
+    return text[:i] + replacement + text[j:]
+
+# Host: eliminate detached camera workers. A watchdog terminates the isolated
+# host process if a driver call never returns, which guarantees device release.
+host_path = 'src/host/main.cpp'
+host = read(host_path)
+host = replace_once(host, '''    ~ComApartment()
+    {
+        if (hr == S_OK)
+        {
+            CoUninitialize();
+        }
+    }''', '''    ~ComApartment()
+    {
+        if (SUCCEEDED(hr))
+        {
+            CoUninitialize();
+        }
+    }''', 'host COM lifetime')
+
+host_camera = r'''static ULONGLONG GetAwakeMilliseconds()
+{
+    ULONGLONG unbiased100ns = 0;
+    if (QueryUnbiasedInterruptTime(&unbiased100ns))
+    {
+        return unbiased100ns / 10000ULL;
+    }
+    return GetTickCount64();
+}
+
+// Camera driver calls can block inside DirectShow/MSMF and cannot be safely
+// cancelled from another thread. FaceLogonHost is an isolated helper process,
+// so a watchdog terminates the whole process on a genuine awake-time timeout.
+// No detached thread can survive and keep the camera device locked.
+static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    const DWORD OVERALL_TIMEOUT_MS = 60000;
+    const int MAX_RETRIES = 8;
+    const int RETRY_DELAY_MS = 1500;
+
+    std::atomic<bool> finished{false};
+    const ULONGLONG startAwakeMs = GetAwakeMilliseconds();
+    std::thread watchdog([&finished, startAwakeMs]()
+    {
+        while (!finished.load())
+        {
+            Sleep(100);
+            if (GetAwakeMilliseconds() - startAwakeMs >= OVERALL_TIMEOUT_MS)
+            {
+                HostLog("ERROR",
+                        "Camera initialization exceeded %lu ms of awake time. "
+                        "Terminating isolated host process to release the device.",
+                        OVERALL_TIMEOUT_MS);
+                TerminateProcess(GetCurrentProcess(), ERROR_TIMEOUT);
+                return;
+            }
+        }
+    });
+
+    bool success = false;
+    for (int attempt = 1; attempt <= MAX_RETRIES && g_running; ++attempt)
+    {
+        const bool allowFallback = (attempt >= MAX_RETRIES - 2);
+        HostLog("INFO", "Opening camera index %d (attempt %d/%d, allowFallback=%s)...",
+                cameraIndex, attempt, MAX_RETRIES,
+                allowFallback ? "true" : "false");
+
+        ULONGLONG backendStart = GetAwakeMilliseconds();
+        cap.open(cameraIndex, cv::CAP_DSHOW);
+        HostLog("INFO", "CAP_DSHOW finished: opened=%d, awakeElapsed=%llums",
+                cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+
+        if (!cap.isOpened() && allowFallback)
+        {
+            backendStart = GetAwakeMilliseconds();
+            cap.open(cameraIndex, cv::CAP_MSMF);
+            HostLog("INFO", "CAP_MSMF finished: opened=%d, awakeElapsed=%llums",
+                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+        }
+
+        if (!cap.isOpened() && attempt == MAX_RETRIES)
+        {
+            backendStart = GetAwakeMilliseconds();
+            cap.open(cameraIndex);
+            HostLog("INFO", "Default backend finished: opened=%d, awakeElapsed=%llums",
+                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+        }
+
+        if (cap.isOpened())
+        {
+            ConfigureCameraProperties(cap);
+            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            if (width <= 0 || height <= 0)
+            {
+                width = kCameraWidth;
+                height = kCameraHeight;
+            }
+
+            const int warmAttempts = (attempt < MAX_RETRIES) ? 12 : 40;
+            if (WarmUpCamera(cap, warmAttempts, 100))
+            {
+                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).", width, height);
+                success = true;
+                break;
+            }
+
+            HostLog("WARNING", "Camera opened but did not stream. Releasing before retry.");
+            cap.release();
+        }
+
+        if (attempt < MAX_RETRIES)
+        {
+            Sleep(RETRY_DELAY_MS);
+        }
+    }
+
+    finished.store(true);
+    if (watchdog.joinable())
+    {
+        watchdog.join();
+    }
+
+    if (!success)
+    {
+        HostLog("ERROR", "Failed to open camera device after all retries.");
+    }
+    return success;
+}
+
+'''
+host = replace_span(host, 'struct CameraOpenResult', 'static bool LoadHostConfig', host_camera, 'host camera lifecycle')
+write(host_path, host)
+
+# Setup helper: enumerate camera friendly names and validate the selected index.
+setup_path = 'src/setup/main.cpp'
+setup = read(setup_path)
+setup = replace_once(setup, '#include <windows.h>\n', '#include <windows.h>\n#include <dshow.h>\n', 'DirectShow include')
+setup = replace_once(setup, '#pragma comment(lib, "Bcrypt.lib")\n', '#pragma comment(lib, "Bcrypt.lib")\n#pragma comment(lib, "Strmiids.lib")\n#pragma comment(lib, "Ole32.lib")\n#pragma comment(lib, "OleAut32.lib")\n', 'DirectShow libs')
+setup = replace_once(setup, '''    ~ComApartment()
+    {
+        if (hr == S_OK)
+        {
+            CoUninitialize();
+        }
+    }''', '''    ~ComApartment()
+    {
+        if (SUCCEEDED(hr))
+        {
+            CoUninitialize();
+        }
+    }''', 'setup COM lifetime')
+
+camera_enum = r'''struct CameraDeviceInfo
+{
+    int index;
