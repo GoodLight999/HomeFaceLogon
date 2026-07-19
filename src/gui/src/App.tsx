@@ -1,6 +1,11 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+interface CameraDevice {
+  index: number;
+  name: string;
+}
+
 interface RegistryStatus {
   enabled: boolean;
   sid: string;
@@ -10,6 +15,7 @@ interface RegistryStatus {
   scan_timeout_ms: number;
   liveness_enabled: boolean;
   camera_index: number;
+  setup_complete: boolean;
 }
 
 function App() {
@@ -23,6 +29,8 @@ function App() {
   const [password, setPassword] = useState<string>("");
   const [pin, setPin] = useState<string>("");
   const [cameraIndex, setCameraIndex] = useState<number>(0);
+  const [cameraDevices, setCameraDevices] = useState<CameraDevice[]>([]);
+  const [cameraListError, setCameraListError] = useState<string>("");
 
   // App Config State (Synchronized with registry & config.json)
   const [config, setConfig] = useState<RegistryStatus>({
@@ -34,9 +42,10 @@ function App() {
     scan_timeout_ms: 10000,
     liveness_enabled: false,
     camera_index: 0,
+    setup_complete: false,
   });
 
-  const isConfigured = !!config.sid;
+  const isConfigured = config.setup_complete;
 
   // Logging & Diagnostics States
   const [logType, setLogType] = useState<
@@ -57,6 +66,7 @@ function App() {
   // Load configuration on mount
   useEffect(() => {
     loadConfig();
+    loadCameras();
   }, []);
 
   // Poll logs when on diagnostics tab
@@ -79,6 +89,20 @@ function App() {
       setSid(res.sid.toString());
     } catch (err: any) {
       showStatus(`設定の読み込みに失敗しました: ${err}`, "error");
+    }
+  };
+
+  const loadCameras = async () => {
+    try {
+      const devices = await invoke<CameraDevice[]>("list_cameras");
+      setCameraDevices(devices);
+      setCameraListError("");
+      if (!devices.some((device) => device.index === cameraIndex)) {
+        setCameraIndex(devices[0].index);
+      }
+    } catch (err: any) {
+      setCameraDevices([]);
+      setCameraListError(String(err));
     }
   };
 
@@ -112,52 +136,35 @@ function App() {
       return;
     }
     if (!password) {
-      showStatus(
-        "Microsoftアカウントのパスワードを入力してください。",
-        "error",
-      );
+      showStatus("Windowsサインインパスワードを入力してください。", "error");
       return;
     }
     if (pin.length < 4 || pin.length > 16 || !/^[\x21-\x7E]+$/.test(pin)) {
-      showStatus(
-        "PINは4〜16文字の半角英数字・記号（スペース除く）で入力してください。",
-        "error",
-      );
+      showStatus("PINは4〜16文字の半角英数字・記号（スペース除く）で入力してください。", "error");
       return;
     }
-
-    setLoading(true);
-    try {
-      await invoke<string>("run_setup_binary", {
-        sid,
-        password,
-        pin,
-      });
-      setPassword("");
-      setPin("");
-      showStatus("サインイン資格情報を暗号化して保存しました。", "success");
-      // Advance to face enrollment step
-      setWizardStep(3);
-    } catch (err: any) {
-      showStatus(`セットアップの保存に失敗しました: ${err}`, "error");
-    } finally {
-      setLoading(false);
-    }
+    // Do not write partial credentials yet. Commit the entire setup only after
+    // camera probing and face enrollment succeed.
+    setWizardStep(3);
+    await loadCameras();
   };
 
   const handleStartEnrollment = async () => {
+    if (!cameraDevices.some((device) => device.index === cameraIndex)) {
+      showStatus("一覧から有効なカメラを選択してください。", "error");
+      return;
+    }
     setLoading(true);
     try {
-      showStatus(
-        "顔登録ウィンドウを開いています。カメラを見てください。",
-        "info",
-      );
-      await invoke<string>("run_enroll", { cameraIndex });
-      showStatus("顔情報の登録に成功しました！", "success");
-      setWizardStep(4); // Advance to completion step
-      loadConfig();
+      showStatus("カメラ確認後に顔登録を開始します。失敗時は設定を元に戻します。", "info");
+      await invoke<string>("run_complete_setup", { sid, password, pin, cameraIndex });
+      setPassword("");
+      setPin("");
+      showStatus("資格情報・PIN・顔情報を一括で登録しました。", "success");
+      setWizardStep(4);
+      await loadConfig();
     } catch (err: any) {
-      showStatus(`顔登録に失敗しました: ${err}`, "error");
+      showStatus(`セットアップに失敗しました: ${err}`, "error");
     } finally {
       setLoading(false);
     }
@@ -301,7 +308,7 @@ function App() {
 
         <div className="sidebar-footer">
           <div>管理者権限実行中</div>
-          <div>v0.2.0</div>
+          <div>v0.3.4 camera recovery</div>
         </div>
       </aside>
 
@@ -594,16 +601,33 @@ function App() {
                   <label className="form-label">
                     使用するカメラのインデックス
                   </label>
-                  <select
-                    className="form-input"
-                    value={cameraIndex}
-                    onChange={(e) => setCameraIndex(parseInt(e.target.value))}
-                    style={{ maxWidth: "200px" }}
-                  >
-                    <option value={0}>カメラ 0 (デフォルト)</option>
-                    <option value={1}>カメラ 1</option>
-                    <option value={2}>カメラ 2</option>
-                  </select>
+                  <div className="form-input-container">
+                    <select
+                      className="form-input"
+                      value={cameraIndex}
+                      onChange={(e) => setCameraIndex(parseInt(e.target.value))}
+                      style={{ maxWidth: "420px" }}
+                      disabled={cameraDevices.length === 0}
+                    >
+                      {cameraDevices.length === 0 ? (
+                        <option value={-1}>カメラが見つかりません</option>
+                      ) : (
+                        cameraDevices.map((device) => (
+                          <option key={device.index} value={device.index}>
+                            [{device.index}] {device.name}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <button className="btn btn-secondary" onClick={loadCameras} disabled={loading}>
+                      再読み込み
+                    </button>
+                  </div>
+                  {cameraListError && (
+                    <span className="form-help" style={{ color: "var(--danger)" }}>
+                      {cameraListError}
+                    </span>
+                  )}
                 </div>
 
                 <div
@@ -623,7 +647,7 @@ function App() {
                   <button
                     className="btn btn-success"
                     onClick={handleStartEnrollment}
-                    disabled={loading}
+                    disabled={loading || cameraDevices.length === 0}
                   >
                     {loading
                       ? "カメラ起動中..."
@@ -792,25 +816,29 @@ function App() {
                 <label className="form-label">
                   使用するカメラのインデックス
                 </label>
-                <select
-                  className="form-input"
-                  value={config.camera_index}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      camera_index: parseInt(e.target.value),
-                    }))
-                  }
-                  style={{ maxWidth: "240px" }}
-                >
-                  <option value={0}>0 (デフォルト / 内蔵等)</option>
-                  <option value={1}>1</option>
-                  <option value={2}>2</option>
-                  <option value={3}>3</option>
-                </select>
-                <span className="form-help">
-                  複数のカメラが接続されている場合、使用するカメラのインデックスを選択します。
-                </span>
+                <div className="form-input-container">
+                  <select
+                    className="form-input"
+                    value={config.camera_index}
+                    onChange={(e) => setConfig((prev) => ({ ...prev, camera_index: parseInt(e.target.value) }))}
+                    style={{ maxWidth: "420px" }}
+                    disabled={cameraDevices.length === 0}
+                  >
+                    {cameraDevices.length === 0 ? (
+                      <option value={-1}>カメラが見つかりません</option>
+                    ) : (
+                      cameraDevices.map((device) => (
+                        <option key={device.index} value={device.index}>
+                          [{device.index}] {device.name}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <button className="btn btn-secondary" onClick={loadCameras} disabled={loading}>
+                    再読み込み
+                  </button>
+                </div>
+                <span className="form-help">Windowsが報告した具体的なデバイス名から選択します。</span>
               </div>
             </div>
 

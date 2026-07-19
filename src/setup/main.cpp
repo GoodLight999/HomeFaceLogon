@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dshow.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <strsafe.h>
@@ -22,6 +23,9 @@
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Bcrypt.lib")
+#pragma comment(lib, "Strmiids.lib")
+#pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "OleAut32.lib")
 
 namespace fs = std::filesystem;
 
@@ -55,7 +59,7 @@ struct ComApartment
     ComApartment() : hr(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
     ~ComApartment()
     {
-        if (hr == S_OK)
+        if (SUCCEEDED(hr))
         {
             CoUninitialize();
         }
@@ -66,6 +70,89 @@ struct ComApartment
         return SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
     }
 };
+
+struct CameraDeviceInfo
+{
+    int index;
+    std::wstring name;
+};
+
+static std::vector<CameraDeviceInfo> EnumerateCameraDevices()
+{
+    std::vector<CameraDeviceInfo> devices;
+    ComApartment com;
+    if (!com.Ok()) return devices;
+
+    ICreateDevEnum* deviceEnumerator = nullptr;
+    IEnumMoniker* monikerEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&deviceEnumerator));
+    if (FAILED(hr) || deviceEnumerator == nullptr) return devices;
+
+    hr = deviceEnumerator->CreateClassEnumerator(
+        CLSID_VideoInputDeviceCategory, &monikerEnumerator, 0);
+    if (hr != S_OK || monikerEnumerator == nullptr)
+    {
+        deviceEnumerator->Release();
+        return devices;
+    }
+
+    IMoniker* moniker = nullptr;
+    ULONG fetched = 0;
+    int index = 0;
+    while (monikerEnumerator->Next(1, &moniker, &fetched) == S_OK)
+    {
+        std::wstring name = L"Camera " + std::to_wstring(index);
+        IPropertyBag* propertyBag = nullptr;
+        if (SUCCEEDED(moniker->BindToStorage(nullptr, nullptr,
+                                             IID_PPV_ARGS(&propertyBag))) &&
+            propertyBag != nullptr)
+        {
+            VARIANT value;
+            VariantInit(&value);
+            if (SUCCEEDED(propertyBag->Read(L"FriendlyName", &value, nullptr)) &&
+                value.vt == VT_BSTR && value.bstrVal != nullptr)
+            {
+                name = value.bstrVal;
+            }
+            VariantClear(&value);
+            propertyBag->Release();
+        }
+        for (wchar_t& ch : name)
+        {
+            if (ch == L'\t' || ch == L'\r' || ch == L'\n') ch = L' ';
+        }
+        devices.push_back({index, name});
+        ++index;
+        moniker->Release();
+    }
+
+    monikerEnumerator->Release();
+    deviceEnumerator->Release();
+    return devices;
+}
+
+static bool IsCameraIndexAvailable(int cameraIndex, std::wstring* friendlyName = nullptr)
+{
+    for (const auto& device : EnumerateCameraDevices())
+    {
+        if (device.index == cameraIndex)
+        {
+            if (friendlyName != nullptr) *friendlyName = device.name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void PrintCameraDevices()
+{
+    for (const auto& device : EnumerateCameraDevices())
+    {
+        std::wcout << device.index << L"\t" << device.name << std::endl;
+    }
+}
 
 static void ConfigureCameraProperties(cv::VideoCapture& cap)
 {
@@ -111,6 +198,17 @@ static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayM
 // the first verification or enrollment attempt.
 static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
 {
+    std::wstring friendlyName;
+    if (!IsCameraIndexAvailable(cameraIndex, &friendlyName))
+    {
+        std::wcerr << L"Error: Camera index " << cameraIndex
+                   << L" is not present. Refresh the camera list and choose a named device."
+                   << std::endl;
+        return false;
+    }
+    std::wcout << L"Selected camera: [" << cameraIndex << L"] "
+               << friendlyName << std::endl;
+
     const int MAX_RETRIES = 3;
     const int RETRY_DELAY_MS = 500;
 
@@ -245,23 +343,40 @@ std::wstring GetModelPath(const std::wstring& filename) {
     return filename;
 }
 
+template <typename Writer>
+static bool WriteFileAtomically(const std::wstring& finalPath, Writer writer)
+{
+    const std::wstring tempPath = finalPath + L".tmp." + std::to_wstring(GetCurrentProcessId());
+    {
+        std::ofstream file(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) return false;
+        writer(file);
+        file.flush();
+        if (!file.good())
+        {
+            file.close();
+            DeleteFileW(tempPath.c_str());
+            return false;
+        }
+    }
+    if (!MoveFileExW(tempPath.c_str(), finalPath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool SaveSecret(const std::wstring& password)
 {
     DATA_BLOB input;
     input.pbData = reinterpret_cast<BYTE*>(const_cast<wchar_t*>(password.c_str()));
     input.cbData = static_cast<DWORD>((password.length() + 1) * sizeof(wchar_t));
-
     DATA_BLOB output = {0};
-    
-    if (!CryptProtectData(
-        &input,
-        L"HomeFaceLogon MSA password",
-        nullptr,
-        nullptr,
-        nullptr,
-        CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
-        &output
-    ))
+    if (!CryptProtectData(&input, L"HomeFaceLogon MSA password", nullptr, nullptr,
+                          nullptr, CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+                          &output))
     {
         std::wcerr << L"CryptProtectData failed: " << GetLastError() << std::endl;
         return false;
@@ -270,6 +385,7 @@ bool SaveSecret(const std::wstring& password)
     wchar_t path[MAX_PATH];
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
     {
+        SecureZeroMemory(output.pbData, output.cbData);
         LocalFree(output.pbData);
         return false;
     }
@@ -277,26 +393,18 @@ bool SaveSecret(const std::wstring& password)
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"secret.bin");
 
-    std::ofstream file(path, std::ios::out | std::ios::binary);
-    if (!file.is_open())
-    {
-        std::wcerr << L"Failed to open secret.bin for writing." << std::endl;
-        LocalFree(output.pbData);
-        return false;
-    }
-
-    SecretFileHeader header;
+    SecretFileHeader header{};
     header.magic = HFLO_MAGIC;
     header.schemaVersion = 1;
-    header.flags = 0;
     header.protectedBlobSize = output.cbData;
-
-    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-    file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
-    file.close();
-
+    const bool ok = WriteFileAtomically(path, [&](std::ofstream& file)
+    {
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
+    });
+    SecureZeroMemory(output.pbData, output.cbData);
     LocalFree(output.pbData);
-    return true;
+    return ok;
 }
 
 struct PinFileHeader {
@@ -313,121 +421,81 @@ const uint32_t PIN_HASH_SIZE = 32;
 bool SavePin(const std::wstring& pin)
 {
     if (pin.empty()) return false;
-
-    // 1. Generate 16 bytes of random salt
     PinFileHeader header = {};
     header.magic = HFLP_MAGIC;
     header.schemaVersion = 1;
-    header.flags = 0;
-    header.iterations = 100000; // PBKDF2 iterations
+    header.iterations = 100000;
+    NTSTATUS status = BCryptGenRandom(nullptr, header.salt, sizeof(header.salt),
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) return false;
 
-    NTSTATUS status = BCryptGenRandom(nullptr, header.salt, sizeof(header.salt), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (!BCRYPT_SUCCESS(status))
-    {
-        std::wcerr << L"BCryptGenRandom failed: 0x" << std::hex << status << std::endl;
-        return false;
-    }
-
-    // 2. Convert PIN to UTF-8
-    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1,
+                                      nullptr, 0, nullptr, nullptr);
     if (utf8Len <= 0) return false;
-
     std::vector<char> pinUtf8(utf8Len);
-    WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1, pinUtf8.data(), utf8Len, nullptr, nullptr);
-    ULONG pinLen = static_cast<ULONG>(utf8Len - 1); // exclude null terminator
+    WideCharToMultiByte(CP_UTF8, 0, pin.c_str(), -1,
+                        pinUtf8.data(), utf8Len, nullptr, nullptr);
 
-    // 3. Derive key via PBKDF2-SHA256
     BCRYPT_ALG_HANDLE hAlg = nullptr;
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
+                                          nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
     if (!BCRYPT_SUCCESS(status))
     {
         SecureZeroMemory(pinUtf8.data(), pinUtf8.size());
         return false;
     }
-
-    uint8_t derivedKey[PIN_HASH_SIZE];
-    status = BCryptDeriveKeyPBKDF2(
-        hAlg,
-        reinterpret_cast<PUCHAR>(pinUtf8.data()),
-        pinLen,
-        header.salt,
-        sizeof(header.salt),
-        header.iterations,
-        derivedKey,
-        PIN_HASH_SIZE,
-        0
-    );
-
+    uint8_t derivedKey[PIN_HASH_SIZE] = {};
+    status = BCryptDeriveKeyPBKDF2(hAlg,
+        reinterpret_cast<PUCHAR>(pinUtf8.data()), static_cast<ULONG>(utf8Len - 1),
+        header.salt, sizeof(header.salt), header.iterations,
+        derivedKey, PIN_HASH_SIZE, 0);
     BCryptCloseAlgorithmProvider(hAlg, 0);
     SecureZeroMemory(pinUtf8.data(), pinUtf8.size());
+    if (!BCRYPT_SUCCESS(status)) return false;
 
-    if (!BCRYPT_SUCCESS(status))
-    {
-        std::wcerr << L"BCryptDeriveKeyPBKDF2 failed: 0x" << std::hex << status << std::endl;
-        return false;
-    }
-
-    // 4. Write to pin.bin
     wchar_t path[MAX_PATH];
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
     {
+        SecureZeroMemory(derivedKey, sizeof(derivedKey));
         return false;
     }
     PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"pin.bin");
-
-    std::ofstream file(path, std::ios::out | std::ios::binary);
-    if (!file.is_open())
+    const bool ok = WriteFileAtomically(path, [&](std::ofstream& file)
     {
-        std::wcerr << L"Failed to open pin.bin for writing." << std::endl;
-        return false;
-    }
-
-    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-    file.write(reinterpret_cast<const char*>(derivedKey), PIN_HASH_SIZE);
-    file.close();
-
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(derivedKey), PIN_HASH_SIZE);
+    });
     SecureZeroMemory(derivedKey, sizeof(derivedKey));
-    return true;
+    return ok;
 }
 
-bool SaveConfig(const std::wstring& sid)
+bool SaveConfig(const std::wstring& sid, int cameraIndex)
 {
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
-    {
-        return false;
-    }
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path))) return false;
     PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"config.json");
 
-    std::ofstream file(path, std::ios::out | std::ios::binary);
-    if (!file.is_open())
+    const std::string utf8Sid = utf16_to_utf8(sid);
+    std::string content;
+    content += "{\n";
+    content += "  \"schemaVersion\": 1,\n";
+    content += "  \"enabled\": false,\n";
+    content += "  \"targetSid\": \"" + utf8Sid + "\",\n";
+    content += "  \"matchThreshold\": 0.363,\n";
+    content += "  \"requiredMatches\": 3,\n";
+    content += "  \"windowSize\": 5,\n";
+    content += "  \"scanTimeoutMs\": 10000,\n";
+    content += "  \"livenessEnabled\": false,\n";
+    content += "  \"cameraIndex\": " + std::to_string(cameraIndex) + "\n";
+    content += "}\n";
+    return WriteFileAtomically(path, [&](std::ofstream& file)
     {
-        std::wcerr << L"Failed to open config.json for writing." << std::endl;
-        return false;
-    }
-
-    int len = WideCharToMultiByte(CP_UTF8, 0, sid.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string utf8Sid(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, sid.c_str(), -1, &utf8Sid[0], len, nullptr, nullptr);
-
-    file << "{\n";
-    file << "  \"schemaVersion\": 1,\n";
-    file << "  \"enabled\": true,\n";
-    file << "  \"targetSid\": \"" << utf8Sid << "\",\n";
-    file << "  \"matchThreshold\": 0.363,\n";
-    file << "  \"requiredMatches\": 3,\n";
-    file << "  \"windowSize\": 5,\n";
-    file << "  \"scanTimeoutMs\": 10000,\n";
-    file << "  \"livenessEnabled\": false,\n";
-    file << "  \"cameraIndex\": 0\n";
-    file << "}\n";
-    file.close();
-
-    return true;
+        file.write(content.data(), static_cast<std::streamsize>(content.size()));
+    });
 }
 
 bool SaveFaceTemplate(const std::vector<float>& featureVec)
@@ -435,22 +503,10 @@ bool SaveFaceTemplate(const std::vector<float>& featureVec)
     DATA_BLOB input;
     input.pbData = reinterpret_cast<BYTE*>(const_cast<float*>(featureVec.data()));
     input.cbData = static_cast<DWORD>(featureVec.size() * sizeof(float));
-
     DATA_BLOB output = {0};
-    
-    if (!CryptProtectData(
-        &input,
-        L"HomeFaceLogon Face Template",
-        nullptr,
-        nullptr,
-        nullptr,
-        CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
-        &output
-    ))
-    {
-        std::wcerr << L"CryptProtectData failed: " << GetLastError() << std::endl;
-        return false;
-    }
+    if (!CryptProtectData(&input, L"HomeFaceLogon Face Template", nullptr, nullptr,
+                          nullptr, CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+                          &output)) return false;
 
     wchar_t path[MAX_PATH];
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
@@ -461,27 +517,17 @@ bool SaveFaceTemplate(const std::vector<float>& featureVec)
     PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"face.bin");
-
-    std::ofstream file(path, std::ios::out | std::ios::binary);
-    if (!file.is_open())
-    {
-        std::wcerr << L"Failed to open face.bin for writing." << std::endl;
-        LocalFree(output.pbData);
-        return false;
-    }
-
-    FaceFileHeader header;
+    FaceFileHeader header{};
     header.magic = HFLF_MAGIC;
     header.schemaVersion = 1;
-    header.flags = 0;
     header.protectedBlobSize = output.cbData;
-
-    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-    file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
-    file.close();
-
+    const bool ok = WriteFileAtomically(path, [&](std::ofstream& file)
+    {
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
+    });
     LocalFree(output.pbData);
-    return true;
+    return ok;
 }
 
 bool LoadFaceTemplate(std::vector<float>& featureVec)
@@ -864,6 +910,34 @@ bool VerifyFace(int cameraIndex)
     return verifySuccess;
 }
 
+bool ProbeCamera(int cameraIndex)
+{
+    std::wstring friendlyName;
+    if (!IsCameraIndexAvailable(cameraIndex, &friendlyName))
+    {
+        std::wcerr << L"Camera index " << cameraIndex << L" is not present." << std::endl;
+        return false;
+    }
+    ComApartment com;
+    if (!com.Ok()) return false;
+    cv::VideoCapture cap;
+    int width = kCameraWidth;
+    int height = kCameraHeight;
+    if (!OpenAndConfigureCamera(cap, cameraIndex, width, height)) return false;
+    cv::Mat frame;
+    const bool ok = cap.read(frame) && !frame.empty();
+    cap.release();
+    cv::destroyAllWindows();
+    if (!ok)
+    {
+        std::wcerr << L"Camera opened but produced no frame." << std::endl;
+        return false;
+    }
+    std::wcout << L"Camera probe succeeded: [" << cameraIndex << L"] "
+               << friendlyName << L" (" << width << L"x" << height << L")" << std::endl;
+    return true;
+}
+
 bool RunDiagnostics()
 {
     std::cout << "[Diagnostic] Starting system diagnostic checks..." << std::endl;
@@ -1011,6 +1085,8 @@ int wmain(int argc, wchar_t* argv[])
     bool enroll = false;
     bool verify = false;
     bool test = false;
+    bool listCameras = false;
+    bool probeCamera = false;
     int cameraIndex = 0;
 
     for (int i = 1; i < argc; ++i)
@@ -1031,10 +1107,33 @@ int wmain(int argc, wchar_t* argv[])
         {
             test = true;
         }
+        else if (_wcsicmp(argv[i], L"--list-cameras") == 0)
+        {
+            listCameras = true;
+        }
+        else if (_wcsicmp(argv[i], L"--probe-camera") == 0)
+        {
+            probeCamera = true;
+        }
         else if (_wcsicmp(argv[i], L"--camera") == 0 && i + 1 < argc)
         {
             cameraIndex = _wtoi(argv[++i]);
         }
+    }
+
+    if (listCameras)
+    {
+        const auto devices = EnumerateCameraDevices();
+        for (const auto& device : devices)
+        {
+            std::wcout << device.index << L"	" << device.name << std::endl;
+        }
+        return devices.empty() ? 1 : 0;
+    }
+
+    if (probeCamera)
+    {
+        return ProbeCamera(cameraIndex) ? 0 : 1;
     }
 
     if (test)
@@ -1152,7 +1251,7 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    if (!SaveConfig(sid))
+    if (!SaveConfig(sid, cameraIndex))
     {
         std::wcerr << L"Failed to save configuration." << std::endl;
         SecureZeroMemory(&password[0], password.length() * sizeof(wchar_t));
