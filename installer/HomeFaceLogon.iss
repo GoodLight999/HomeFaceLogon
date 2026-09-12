@@ -4,12 +4,12 @@
 
 [Setup]
 AppName=HomeFaceLogon
-AppVersion=0.3.3
+AppVersion=0.3.5
 AppPublisher=HomeFaceLogon Team
 DefaultDirName={commonpf}\HomeFaceLogon
 DefaultGroupName=HomeFaceLogon
 OutputDir=..\installer_output
-OutputBaseFilename=HomeFaceLogonSetup-v0.3.3
+OutputBaseFilename=HomeFaceLogonSetup-v0.3.5-camera-recovery
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
@@ -60,7 +60,7 @@ Root: HKLM; Subkey: "SOFTWARE\HomeFaceLogon"; ValueType: string; ValueName: "Pat
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\FaceLogonProvider.dll"""; StatusMsg: "Credential Provider を登録しています..."; Flags: runhidden
 
 ; Launch the Tauri setup wizard manager at the end of installation
-Filename: "{app}\HomeFaceLogon.exe"; Description: "HomeFaceLogon 管理ツールを起動して初期セットアップを行う"; Flags: postinstall nowait runascurrentuser
+Filename: "{app}\HomeFaceLogon.exe"; Description: "HomeFaceLogon 管理ツールを起動して初期セットアップを行う"; Flags: postinstall nowait
 
 [UninstallRun]
 ; Unregister the Credential Provider COM DLL during uninstall

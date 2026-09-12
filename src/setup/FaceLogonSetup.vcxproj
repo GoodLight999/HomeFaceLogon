@@ -54,7 +54,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>..\..\third_party\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Crypt32.lib;Shlwapi.lib;opencv_world4100d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Crypt32.lib;Shlwapi.lib;Strmiids.lib;Ole32.lib;OleAut32.lib;opencv_world4100d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /y /d "..\..\third_party\opencv\build\x64\vc16\bin\opencv_world4100d.dll" "$(OutDir)"
@@ -79,7 +79,7 @@ xcopy /y /d "..\..\third_party\opencv\build\x64\vc16\bin\opencv_videoio_msmf4100
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>..\..\third_party\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>Crypt32.lib;Shlwapi.lib;opencv_world4100.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Crypt32.lib;Shlwapi.lib;Strmiids.lib;Ole32.lib;OleAut32.lib;opencv_world4100.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /y /d "..\..\third_party\opencv\build\x64\vc16\bin\opencv_world4100.dll" "$(OutDir)"

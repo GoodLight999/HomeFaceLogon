@@ -394,7 +394,7 @@ struct ComApartment
     ComApartment() : hr(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
     ~ComApartment()
     {
-        if (hr == S_OK)
+        if (SUCCEEDED(hr))
         {
             CoUninitialize();
         }
@@ -437,165 +437,114 @@ static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayM
 // timed-out threads.  Detached threads held the camera device lock, causing ALL
 // subsequent retry workers to also time out.  This new design ensures only one
 // thread ever touches the camera at any given time.
-struct CameraOpenResult
+static ULONGLONG GetAwakeMilliseconds()
 {
-    cv::VideoCapture cap;
-    int width = 0;
-    int height = 0;
-    bool success = false;
-};
-
-static void CameraWorkerThread(int cameraIndex, std::shared_ptr<CameraOpenResult> result,
-                               std::shared_ptr<std::atomic<bool>> done)
-{
-    ComApartment com;
-    if (!com.Ok())
+    ULONGLONG unbiased100ns = 0;
+    if (QueryUnbiasedInterruptTime(&unbiased100ns))
     {
-        HostLog("ERROR", "Camera worker: COM init failed.");
-        done->store(true);
-        return;
+        return unbiased100ns / 10000ULL;
     }
+    return GetTickCount64();
+}
 
-    const int MAX_RETRIES = 5;
-    const int RETRY_DELAY_MS = 1000;
+// Camera driver calls can block inside DirectShow/MSMF and cannot be safely
+// cancelled from another thread. FaceLogonHost is an isolated helper process,
+// so a watchdog terminates the whole process on a genuine awake-time timeout.
+// No detached thread can survive and keep the camera device locked.
+static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    const DWORD OVERALL_TIMEOUT_MS = 60000;
+    const int MAX_RETRIES = 8;
+    const int RETRY_DELAY_MS = 1500;
 
-    for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt)
+    std::atomic<bool> finished{false};
+    const ULONGLONG startAwakeMs = GetAwakeMilliseconds();
+    std::thread watchdog([&finished, startAwakeMs]()
     {
-        const bool allowFallback = (attempt >= MAX_RETRIES - 1);
-        HostLog("INFO", "Attempting to open camera index %d (attempt %d/%d, allowFallback=%s)...",
-                cameraIndex, attempt, MAX_RETRIES, allowFallback ? "true" : "false");
-
-        ULONGLONG backendStart = GetTickCount64();
-
-        // Try DirectShow first (usually fastest)
-        HostLog("INFO", "Attempting to open camera index %d using CAP_DSHOW (allowFallback=%s)...",
-                cameraIndex, allowFallback ? "true" : "false");
-        result->cap.open(cameraIndex, cv::CAP_DSHOW);
-        ULONGLONG elapsed = GetTickCount64() - backendStart;
-        HostLog("INFO", "CAP_DSHOW open finished: opened=%d, elapsed=%llums",
-                result->cap.isOpened(), elapsed);
-
-        // Fallback to MSMF if DirectShow failed
-        if (!result->cap.isOpened() && allowFallback)
+        while (!finished.load())
         {
-            backendStart = GetTickCount64();
-            HostLog("INFO", "DirectShow failed, trying Media Foundation (CAP_MSMF)...");
-            result->cap.open(cameraIndex, cv::CAP_MSMF);
-            HostLog("INFO", "CAP_MSMF open finished: opened=%d, elapsed=%llums",
-                    result->cap.isOpened(), GetTickCount64() - backendStart);
-        }
-
-        // Fallback to default backend
-        if (!result->cap.isOpened() && allowFallback)
-        {
-            backendStart = GetTickCount64();
-            HostLog("INFO", "Media Foundation failed, trying default backend...");
-            result->cap.open(cameraIndex);
-            HostLog("INFO", "Default backend open finished: opened=%d, elapsed=%llums",
-                    result->cap.isOpened(), GetTickCount64() - backendStart);
-        }
-
-        if (result->cap.isOpened())
-        {
-            ConfigureCameraProperties(result->cap);
-
-            result->width = static_cast<int>(result->cap.get(cv::CAP_PROP_FRAME_WIDTH));
-            result->height = static_cast<int>(result->cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-            if (result->width <= 0 || result->height <= 0)
+            Sleep(100);
+            if (GetAwakeMilliseconds() - startAwakeMs >= OVERALL_TIMEOUT_MS)
             {
-                result->width = kCameraWidth;
-                result->height = kCameraHeight;
-            }
-
-            int warmAttempts = (attempt < MAX_RETRIES) ? 10 : 30;
-            if (WarmUpCamera(result->cap, warmAttempts))
-            {
-                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).",
-                        result->width, result->height);
-                result->success = true;
-                done->store(true);
+                HostLog("ERROR",
+                        "Camera initialization exceeded %lu ms of awake time. "
+                        "Terminating isolated host process to release the device.",
+                        OVERALL_TIMEOUT_MS);
+                TerminateProcess(GetCurrentProcess(), ERROR_TIMEOUT);
                 return;
             }
+        }
+    });
 
-            HostLog("WARNING", "Camera opened but warm-up failed. Releasing for retry...");
-            result->cap.release();
+    bool success = false;
+    for (int attempt = 1; attempt <= MAX_RETRIES && g_running; ++attempt)
+    {
+        const bool allowFallback = (attempt >= MAX_RETRIES - 2);
+        HostLog("INFO", "Opening camera index %d (attempt %d/%d, allowFallback=%s)...",
+                cameraIndex, attempt, MAX_RETRIES,
+                allowFallback ? "true" : "false");
+
+        ULONGLONG backendStart = GetAwakeMilliseconds();
+        cap.open(cameraIndex, cv::CAP_DSHOW);
+        HostLog("INFO", "CAP_DSHOW finished: opened=%d, awakeElapsed=%llums",
+                cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+
+        if (!cap.isOpened() && allowFallback)
+        {
+            backendStart = GetAwakeMilliseconds();
+            cap.open(cameraIndex, cv::CAP_MSMF);
+            HostLog("INFO", "CAP_MSMF finished: opened=%d, awakeElapsed=%llums",
+                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+        }
+
+        if (!cap.isOpened() && attempt == MAX_RETRIES)
+        {
+            backendStart = GetAwakeMilliseconds();
+            cap.open(cameraIndex);
+            HostLog("INFO", "Default backend finished: opened=%d, awakeElapsed=%llums",
+                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
+        }
+
+        if (cap.isOpened())
+        {
+            ConfigureCameraProperties(cap);
+            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            if (width <= 0 || height <= 0)
+            {
+                width = kCameraWidth;
+                height = kCameraHeight;
+            }
+
+            const int warmAttempts = (attempt < MAX_RETRIES) ? 12 : 40;
+            if (WarmUpCamera(cap, warmAttempts, 100))
+            {
+                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).", width, height);
+                success = true;
+                break;
+            }
+
+            HostLog("WARNING", "Camera opened but did not stream. Releasing before retry.");
+            cap.release();
         }
 
         if (attempt < MAX_RETRIES)
         {
-            HostLog("INFO", "Camera device busy or resuming. Waiting %d ms before retry...",
-                    RETRY_DELAY_MS);
             Sleep(RETRY_DELAY_MS);
         }
     }
 
-    HostLog("ERROR", "Failed to open camera device after all retries.");
-    done->store(true);
-}
-
-// Opens the camera using a single dedicated worker thread.
-// The main thread polls for completion with an overall timeout.
-//
-// IMPORTANT: We cannot use a simple GetTickCount64() deadline because the tick
-// counter keeps running during sleep/hibernate.  If the system sleeps for hours,
-// the deadline would have already passed on resume, causing instant false timeout.
-// Instead we accumulate only "awake" elapsed time between polls.  Any gap larger
-// than 2 seconds between consecutive polls is assumed to be a sleep interval and
-// is excluded from the elapsed total.
-static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
-{
-    const DWORD OVERALL_TIMEOUT_MS = 25000;
-    const DWORD POLL_INTERVAL_MS = 100;
-    // Any single poll gap larger than this is assumed to be a sleep/resume event.
-    const DWORD SLEEP_GAP_THRESHOLD_MS = 2000;
-
-    auto result = std::make_shared<CameraOpenResult>();
-    auto done = std::make_shared<std::atomic<bool>>(false);
-
-    std::thread worker(CameraWorkerThread, cameraIndex, result, done);
-
-    ULONGLONG awakeElapsedMs = 0;
-    ULONGLONG lastPollTick = GetTickCount64();
-
-    while (!done->load())
+    finished.store(true);
+    if (watchdog.joinable())
     {
-        Sleep(POLL_INTERVAL_MS);
-
-        ULONGLONG now = GetTickCount64();
-        ULONGLONG gap = now - lastPollTick;
-        lastPollTick = now;
-
-        if (gap < SLEEP_GAP_THRESHOLD_MS)
-        {
-            awakeElapsedMs += gap;
-        }
-        else
-        {
-            // Large gap detected — system likely resumed from sleep.
-            // Reset elapsed time so the worker gets a fresh chance.
-            HostLog("INFO", "Sleep/resume detected (gap=%llums). Resetting camera timeout.", gap);
-            awakeElapsedMs = 0;
-        }
-
-        if (awakeElapsedMs >= OVERALL_TIMEOUT_MS)
-        {
-            HostLog("WARNING", "Camera open overall timeout (%lu ms awake time). Worker thread still running.",
-                    OVERALL_TIMEOUT_MS);
-            worker.detach();
-            return false;
-        }
+        watchdog.join();
     }
 
-    worker.join();
-
-    if (result->success)
+    if (!success)
     {
-        cap = std::move(result->cap);
-        width = result->width;
-        height = result->height;
-        return true;
+        HostLog("ERROR", "Failed to open camera device after all retries.");
     }
-    return false;
+    return success;
 }
 
 static bool LoadHostConfig(HostConfig& config)

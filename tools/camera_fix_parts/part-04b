@@ -1,0 +1,90 @@
+#[tauri::command]
+fn run_enroll(camera_index: i32) -> Result<String, String> {
+    run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))
+}
+#[tauri::command]
+fn run_verify(camera_index: i32) -> Result<String, String> {
+    run_setup_process(&["--verify".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(90))
+}
+#[tauri::command]
+fn run_test() -> Result<String, String> {
+    run_setup_process(&["--test".into()], None, Duration::from_secs(60))
+}
+#[tauri::command]
+fn read_log_file(name: String) -> Result<String, String> {
+    if name != "FaceLogonHost.log" && name != "FaceLogonSetup.log" && name != "FaceLogon.log" {
+        return Err("Access denied: invalid log file name".to_string());
+    }
+    let path = data_dir()?.join("logs").join(name);
+    if !path.exists() { return Ok("No log content found yet.".to_string()); }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = content.lines().collect();
+    Ok(lines[lines.len().saturating_sub(100)..].join("\n"))
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info).build())?;
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![get_registry_status, set_registry_status,
+            get_user_sid, list_cameras, run_complete_setup, run_enroll, run_verify,
+            run_test, read_log_file])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+'''
+write('src/gui/src-tauri/src/lib.rs', lib_rs)
+
+build_rs = r'''fn main() {
+    let windows = tauri_build::WindowsAttributes::new().app_manifest(r#"
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency><dependentAssembly><assemblyIdentity type="win32"
+    name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+    processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+  </dependentAssembly></dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
+    <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+  </requestedPrivileges></security></trustInfo>
+</assembly>
+"#);
+    let attrs = tauri_build::Attributes::new().windows_attributes(windows);
+    tauri_build::try_build(attrs).expect("failed to run tauri build script");
+}
+'''
+write('src/gui/src-tauri/build.rs', build_rs)
+
+app_path = 'src/gui/src/App.tsx'
+app = read(app_path)
+app = replace_once(app, '''interface RegistryStatus {
+  enabled: boolean;''', '''interface CameraDevice {
+  index: number;
+  name: string;
+}
+
+interface RegistryStatus {
+  enabled: boolean;''', 'CameraDevice interface')
+app = replace_once(app, '''  camera_index: number;
+}''', '''  camera_index: number;
+  setup_complete: boolean;
+}''', 'setup complete interface')
+app = replace_once(app, '''    liveness_enabled: false,
+    camera_index: 0,
+  });''', '''    liveness_enabled: false,
+    camera_index: 0,
+    setup_complete: false,
+  });''', 'setup complete default')
+app = replace_once(app, '''  const [cameraIndex, setCameraIndex] = useState<number>(0);
+
+  // App Config State''', '''  const [cameraIndex, setCameraIndex] = useState<number>(0);
+  const [cameraDevices, setCameraDevices] = useState<CameraDevice[]>([]);
+  const [cameraListError, setCameraListError] = useState<string>("");
+
+  // App Config State''', 'camera state')
+app = replace_once(app, '  const isConfigured = !!config.sid;', '  const isConfigured = config.setup_complete;', 'complete state')
+app = replace_once(app, '''  useEffect(() => {

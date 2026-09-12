@@ -1,0 +1,90 @@
+    let mut threshold = 0.363;
+    let mut required_matches = 3;
+    let mut window_size = 5;
+    let mut scan_timeout_ms = 10000;
+    let mut liveness_enabled = false;
+    let mut camera_index = 0;
+    if let Ok(path) = config_path() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                sid = v["targetSid"].as_str().unwrap_or_default().to_string();
+                threshold = v["matchThreshold"].as_f64().unwrap_or(threshold);
+                required_matches = v["requiredMatches"].as_i64().unwrap_or(3) as i32;
+                window_size = v["windowSize"].as_i64().unwrap_or(5) as i32;
+                scan_timeout_ms = v["scanTimeoutMs"].as_i64().unwrap_or(10000) as i32;
+                liveness_enabled = v["livenessEnabled"].as_bool().unwrap_or(false);
+                camera_index = v["cameraIndex"].as_i64().unwrap_or(0) as i32;
+            }
+        }
+    }
+    let setup_complete = !sid.is_empty() && setup_files_complete();
+    if enabled && !setup_complete { let _ = set_enabled(false); enabled = false; }
+    Ok(RegistryStatus { enabled, sid, threshold, required_matches, window_size,
+        scan_timeout_ms, liveness_enabled, camera_index, setup_complete })
+}
+
+#[tauri::command]
+fn set_registry_status(enabled: bool, sid: String, threshold: f64, required_matches: i32,
+    window_size: i32, scan_timeout_ms: i32, liveness_enabled: bool, camera_index: i32) -> Result<(), String> {
+    if enabled && (!setup_files_complete() || sid.trim().is_empty()) {
+        return Err("セットアップが不完全です。資格情報・PIN・顔登録を完了してください。".to_string());
+    }
+    let path = config_path()?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let value = serde_json::json!({
+        "schemaVersion": 1, "enabled": enabled, "targetSid": sid,
+        "matchThreshold": threshold, "requiredMatches": required_matches,
+        "windowSize": window_size, "scanTimeoutMs": scan_timeout_ms,
+        "livenessEnabled": liveness_enabled, "cameraIndex": camera_index,
+        "hostStartupTimeoutMs": 65000, "modelVersion": "1.0"
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    set_enabled(enabled)
+}
+
+#[tauri::command]
+fn get_user_sid() -> Result<String, String> {
+    let output = Command::new("powershell").args(["-NoProfile", "-Command",
+        "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"])
+        .creation_flags(CREATE_NO_WINDOW).output().map_err(|e| e.to_string())?;
+    let sid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !sid.is_empty() { return Ok(sid); }
+    Err("Could not retrieve current user's SID.".to_string())
+}
+
+#[tauri::command]
+fn list_cameras() -> Result<Vec<CameraDevice>, String> {
+    let output = run_setup_process(&["--list-cameras".to_string()], None, Duration::from_secs(15))?;
+    let devices: Vec<CameraDevice> = output.lines().filter_map(|line| {
+        let (index, name) = line.split_once('\t')?;
+        Some(CameraDevice { index: index.trim().parse().ok()?, name: name.trim().to_string() })
+    }).collect();
+    if devices.is_empty() { Err("利用可能なカメラが見つかりません。".to_string()) } else { Ok(devices) }
+}
+
+#[tauri::command]
+fn run_complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
+    if sid.trim().is_empty() || password.is_empty() || pin.is_empty() {
+        return Err("SID、パスワード、PINは必須です。".to_string());
+    }
+    let snapshot = snapshot_files()?;
+    let result = (|| {
+        run_setup_process(&["--probe-camera".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(30))?;
+        run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))?;
+        run_setup_process(&["--sid".into(), sid, "--camera".into(), camera_index.to_string()],
+            Some(&format!("{}\n{}\n", password, pin)), Duration::from_secs(30))
+    })();
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            let rollback = restore_files(&snapshot);
+            let _ = set_enabled(false);
+            match rollback {
+                Ok(()) => Err(format!("{}\n変更は元の状態へ戻しました。", error)),
+                Err(e) => Err(format!("{}\nロールバックにも失敗しました: {}", error, e)),
+            }
+        }
+    }
+}
+
