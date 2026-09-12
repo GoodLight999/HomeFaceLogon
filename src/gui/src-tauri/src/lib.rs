@@ -10,6 +10,19 @@ use winreg::RegKey;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const SETUP_FILES: [&str; 4] = ["secret.bin", "pin.bin", "config.json", "face.bin"];
+static SETUP_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Tauri synchronous commands run on the UI thread. Keep helper waits off that
+// thread, while preventing two camera operations or setup writes from racing.
+async fn background_operation<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SETUP_OPERATION.try_lock()
+            .map_err(|_| "別の処理が実行中です。完了してから再試行してください。".to_string())?;
+        operation()
+    }).await.map_err(|e| e.to_string())?
+}
 
 #[derive(Serialize)]
 pub struct RegistryStatus {
@@ -81,14 +94,19 @@ fn find_setup_exe() -> Result<PathBuf, String> {
 
 fn run_setup_process(args: &[String], stdin_content: Option<&str>, timeout: Duration) -> Result<String, String> {
     let setup_exe = find_setup_exe()?;
-    let mut child = Command::new(&setup_exe)
-        .args(args)
+    let mut command = Command::new(&setup_exe);
+    command.args(args);
+    run_process(command, stdin_content, timeout)
+}
+
+fn run_process(mut command: Command, stdin_content: Option<&str>, timeout: Duration) -> Result<String, String> {
+    let mut child = command
         .stdin(if stdin_content.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .map_err(|e| format!("Failed to start {}: {}", setup_exe.display(), e))?;
+        .map_err(|e| format!("Failed to start helper: {}", e))?;
 
     let stdout_reader = child.stdout.take().map(|mut stream| thread::spawn(move || {
         let mut bytes = Vec::new(); let _ = stream.read_to_end(&mut bytes); bytes
@@ -99,7 +117,10 @@ fn run_setup_process(args: &[String], stdin_content: Option<&str>, timeout: Dura
 
     if let Some(content) = stdin_content {
         let mut stdin = child.stdin.take().ok_or("Failed to open setup stdin")?;
-        stdin.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+        if let Err(error) = stdin.write_all(content.as_bytes()) {
+            let _ = child.kill(); let _ = child.wait();
+            return Err(error.to_string());
+        }
     }
 
     let started = Instant::now();
@@ -185,6 +206,8 @@ fn get_registry_status() -> Result<RegistryStatus, String> {
 #[tauri::command]
 fn set_registry_status(enabled: bool, sid: String, threshold: f64, required_matches: i32,
     window_size: i32, scan_timeout_ms: i32, liveness_enabled: bool, camera_index: i32) -> Result<(), String> {
+    let _guard = SETUP_OPERATION.try_lock()
+        .map_err(|_| "別の処理が実行中です。完了してから設定を保存してください。".to_string())?;
     if enabled && (!setup_files_complete() || sid.trim().is_empty()) {
         return Err("セットアップが不完全です。資格情報・PIN・顔登録を完了してください。".to_string());
     }
@@ -203,7 +226,11 @@ fn set_registry_status(enabled: bool, sid: String, threshold: f64, required_matc
 }
 
 #[tauri::command]
-fn get_user_sid() -> Result<String, String> {
+async fn get_user_sid() -> Result<String, String> {
+    background_operation(get_user_sid_blocking).await
+}
+
+fn get_user_sid_blocking() -> Result<String, String> {
     let output = Command::new("powershell").args(["-NoProfile", "-Command",
         "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"])
         .creation_flags(CREATE_NO_WINDOW).output().map_err(|e| e.to_string())?;
@@ -213,7 +240,11 @@ fn get_user_sid() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn list_cameras() -> Result<Vec<CameraDevice>, String> {
+async fn list_cameras() -> Result<Vec<CameraDevice>, String> {
+    background_operation(list_cameras_blocking).await
+}
+
+fn list_cameras_blocking() -> Result<Vec<CameraDevice>, String> {
     let output = run_setup_process(&["--list-cameras".to_string()], None, Duration::from_secs(15))?;
     let devices: Vec<CameraDevice> = output.lines().filter_map(|line| {
         let (index, name) = line.split_once('\t')?;
@@ -223,7 +254,11 @@ fn list_cameras() -> Result<Vec<CameraDevice>, String> {
 }
 
 #[tauri::command]
-fn run_complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
+async fn run_complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
+    background_operation(move || complete_setup(sid, password, pin, camera_index)).await
+}
+
+fn complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
     if sid.trim().is_empty() || password.is_empty() || pin.is_empty() {
         return Err("SID、パスワード、PINは必須です。".to_string());
     }
@@ -248,16 +283,16 @@ fn run_complete_setup(sid: String, password: String, pin: String, camera_index: 
 }
 
 #[tauri::command]
-fn run_enroll(camera_index: i32) -> Result<String, String> {
-    run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))
+async fn run_enroll(camera_index: i32) -> Result<String, String> {
+    background_operation(move || run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))).await
 }
 #[tauri::command]
-fn run_verify(camera_index: i32) -> Result<String, String> {
-    run_setup_process(&["--verify".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(90))
+async fn run_verify(camera_index: i32) -> Result<String, String> {
+    background_operation(move || run_setup_process(&["--verify".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(90))).await
 }
 #[tauri::command]
-fn run_test() -> Result<String, String> {
-    run_setup_process(&["--test".into()], None, Duration::from_secs(60))
+async fn run_test() -> Result<String, String> {
+    background_operation(|| run_setup_process(&["--test".into()], None, Duration::from_secs(60))).await
 }
 #[tauri::command]
 fn read_log_file(name: String) -> Result<String, String> {
@@ -286,4 +321,45 @@ pub fn run() {
             run_test, read_log_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn powershell(script: &str) -> Command {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        command
+    }
+
+    #[test]
+    fn a_stuck_helper_is_terminated_and_the_next_operation_runs() {
+        let started = Instant::now();
+        let error = run_process(powershell("[Threading.Thread]::Sleep(20000)"),
+            None, Duration::from_millis(300)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let output = run_process(powershell("Write-Output 'recovered'"),
+            None, Duration::from_secs(15)).unwrap();
+        assert!(output.contains("recovered"));
+    }
+
+    #[test]
+    fn both_output_pipes_are_drained_without_deadlock() {
+        let output = run_process(powershell(
+            "[Console]::Out.Write(('o' * 100000)); [Console]::Error.Write(('e' * 100000))"),
+            None, Duration::from_secs(15)).unwrap();
+        assert_eq!(output.len(), 100000);
+    }
+
+    #[test]
+    fn stdin_is_closed_and_failure_reports_stderr() {
+        let output = run_process(powershell("[Console]::Out.Write([Console]::In.ReadToEnd())"),
+            Some("test input\n"), Duration::from_secs(15)).unwrap();
+        assert_eq!(output, "test input\n");
+        let error = run_process(powershell("[Console]::Error.Write('camera unavailable'); exit 1"),
+            None, Duration::from_secs(15)).unwrap_err();
+        assert_eq!(error, "camera unavailable");
+    }
 }

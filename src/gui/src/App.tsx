@@ -181,7 +181,7 @@ function App() {
         windowSize: config.window_size,
         scanTimeoutMs: config.scan_timeout_ms,
         livenessEnabled: config.liveness_enabled,
-        cameraIndex: cameraIndex,
+        cameraIndex: config.camera_index,
       });
       showStatus("設定を保存し適用しました。", "success");
       loadConfig();
@@ -198,7 +198,7 @@ function App() {
       "顔照合テストを実行中... カメラが起動します。カメラを見てください。\n",
     );
     try {
-      const res = await invoke<string>("run_verify", { cameraIndex });
+      const res = await invoke<string>("run_verify", { cameraIndex: config.camera_index });
       setDiagOutput((prev) => prev + "【結果】成功\n" + res);
       showStatus("照合テストが正常に完了しました。", "success");
     } catch (err: any) {
@@ -308,7 +308,7 @@ function App() {
 
         <div className="sidebar-footer">
           <div>管理者権限実行中</div>
-          <div>v0.3.4 camera recovery</div>
+          <div>v0.3.5 camera recovery</div>
         </div>
       </aside>
 
@@ -814,7 +814,7 @@ function App() {
 
               <div className="form-group" style={{ marginTop: "20px" }}>
                 <label className="form-label">
-                  使用するカメラのインデックス
+                  使用するカメラ
                 </label>
                 <div className="form-input-container">
                   <select

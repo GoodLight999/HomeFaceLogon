@@ -76,6 +76,11 @@ jobs:
           npm install
           npm run tauri build -- --no-bundle
 
+      - name: Test helper timeout and output handling
+        shell: pwsh
+        working-directory: src/gui/src-tauri
+        run: cargo test --release --lib
+
       - name: Ensure Inno Setup
         shell: pwsh
         run: |
@@ -90,7 +95,7 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: HomeFaceLogon-v0.3.4-camera-recovery
+          name: HomeFaceLogon-v0.3.5-camera-recovery
           path: installer_output/*.exe
           if-no-files-found: error
           retention-days: 30
