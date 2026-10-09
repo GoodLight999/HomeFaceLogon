@@ -123,6 +123,10 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
+        hr = SHStrDupW(L"顔認証（HomeFaceLogon）", &_rgFieldStrings[SFI_PROVIDER_LABEL]);
+    }
+    if (SUCCEEDED(hr))
+    {
         hr = pcpUser->GetStringValue(PKEY_Identity_QualifiedUserName, &_pszQualifiedUserName);
     }
     if (SUCCEEDED(hr))
@@ -261,7 +265,9 @@ HRESULT CSampleCredential::GetBitmapValue(DWORD dwFieldID, _Outptr_result_nullon
 
     if ((SFI_TILEIMAGE == dwFieldID))
     {
-        HBITMAP hbmp = LoadBitmap(HINST_THISDLL, MAKEINTRESOURCE(IDB_TILE_IMAGE));
+        // Keep the 32-bit alpha channel in the provider logo.
+        HBITMAP hbmp = static_cast<HBITMAP>(LoadImageW(HINST_THISDLL,
+            MAKEINTRESOURCEW(IDB_TILE_IMAGE), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
         if (hbmp != nullptr)
         {
             hr = S_OK;

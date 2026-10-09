@@ -1,7 +1,8 @@
 # Authentication lifecycle regression fixes
 
 This change builds on the unmerged camera recovery and transactional setup PR.
-It is a **candidate for physical validation**, not a verified Windows unlock release.
+The core unlock paths have been validated on the test PC. Sleep/resume, camera
+contention and interactive enrollment failure paths still require physical checks.
 
 ## Findings and changes
 
@@ -21,7 +22,7 @@ It is a **candidate for physical validation**, not a verified Windows unlock rel
   as auto-logon. Actual deselection, failure and provider detachment still clear it.
   An unused face proof expires after ten seconds, including time spent suspended.
   A regression reproduces the callback replacement, selection and duplicate-call
-  sequence; reverting only `UnAdvise` makes it fail. Physical retesting is required.
+  sequence; reverting only `UnAdvise` makes it fail. Physical retesting succeeded.
 - **Worker cancellation could outlive the credential.** Pipe workers post to the
   credential's message window. UI/COM updates run on its owning thread. Session
   generations reject queued results after cancellation. Cancellation drains
@@ -94,22 +95,56 @@ The setup executable test verifies UTF-8 password storage/decryption through rea
 DPAPI, rejection without changing synthetic files, and diagnostics preserving a
 sentinel face file. Models are required for its diagnostic success assertion.
 
+## Physical validation on 2026-10-09
+
+The upgraded binaries were compared with the tested build, COM activation and
+installed diagnostics succeeded, and all four existing enrollment/configuration
+files remained byte-identical with Enabled preserved. No restart was required.
+
+The user confirmed unlock with a partially typed, unsubmitted PIN, unlock with no
+PIN input, and unlock after switching to the standard Windows provider and back.
+The real LogonUI trace now shows callback replacement preserving the face proof,
+`autoLogon=1`, finished serialization, and `ReportResult(STATUS_SUCCESS)`.
+
+The sample book/Controls bitmap has also been replaced with a licensed Lucide face
+scan icon, a 72x72 transparent DIB and a descriptive sign-in option tooltip.
+The native resource check confirmed its alpha pixels survive loading from the DLL.
+After the icon update, the user confirmed both its lock-screen display and unlock
+on the installed build.
+
+## Lock-time network observation
+
+A bounded HTTPS probe ran while the user locked the PC and covered the camera for
+about thirteen seconds before unlocking. All 36 requests across 12 completed
+locked samples received HTTP responses: Cloudflare returned 200, and ChatGPT and
+the Codex cloud environment API returned 403 without authentication. These responses
+confirm DNS/TLS/HTTPS connectivity during the observed interval; they do not verify
+the authenticated Codex streaming connection. No request failed in the full probe.
+
+The reported Codex error says the peer closed a TLS connection without sending
+`close_notify`. This observation does not establish which peer or intermediary
+closed the stream, or why. A network-wide disconnect was not observed during this
+test. However, at 23:14:36-43 (shortly after unlock), the actual desktop log records
+multiple Codex cloud WebSocket connections closing with code 1006. Its local work
+executor also reports Windows socket error 10054 and exits twice before reconnecting
+at 23:14:48. The HTTPS probes continued receiving responses during this interval.
+This establishes a real Codex connection failure despite successful short requests;
+the probes cannot rule out selective or transient network-path failures. The reported
+model response stream error may be a separate connection, and the local logs do not
+identify its cause. No network, VPN, power or Codex settings were changed.
+
 ## Remaining physical checks
 
 - Install with a recoverable copy of the existing binaries/configuration and a
   working standard Windows sign-in method; approve any required restart separately.
-- Lock the workstation. Type one or more PIN characters while the camera is
-  preparing/searching; do not submit. A face match should unlock immediately.
 - Submit an incorrect PIN before a match, then retry face authentication. Check
   that PIN rate limiting is preserved and the camera remains usable.
-- Switch away from the face tile during scanning and return. Cancelled results
-  must not submit credentials, and the next scan must work.
 - Repeat after sleep/resume and with a busy/disconnected camera.
 - Cancel enrollment; simulate a setup/password helper error. Existing enrollment,
   Enabled state and unrelated settings should remain usable; retry must succeed.
 
-The hidden-window delivery depends on the real LogonUI message loop and therefore
-requires secure-desktop testing. Browser tests with mocked Tauri calls cannot
-establish this. Abrupt termination during the multi-file commit is not automatically
+Hidden-window delivery has been exercised in the real LogonUI message loop for
+the confirmed cases above. Browser tests with mocked Tauri calls cannot establish
+this. Abrupt termination during the multi-file commit is not automatically
 recovered: the provider remains disabled and the disk backup is retained. The
 individual replacements are atomic, not the complete four-file transaction.

@@ -40,6 +40,7 @@ Source: "..\x64\Release\opencv_videoio_ffmpeg4100_64.dll"; DestDir: "{app}"; Fla
 
 ; Tauri Manager GUI app
 Source: "..\src\gui\src-tauri\target\release\app.exe"; DestDir: "{app}"; DestName: "HomeFaceLogon.exe"; Flags: ignoreversion
+Source: "..\src\provider\icons\LICENSE-lucide.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ONNX Models
 Source: "..\models\face_detection_yunet_2023mar.onnx"; DestDir: "{commonappdata}\HomeFaceLogon\models"; Flags: ignoreversion
