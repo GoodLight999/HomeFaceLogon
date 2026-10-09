@@ -118,6 +118,7 @@ public:
     BOOL                                    _fIsLocalUser;                                  // If the cred prov is assosiating with a local user tile
     bool                                    _fFaceAuthSuccess;                              // True if face authentication matched successfully
     bool                                    _fSubmitting;
+    ULONGLONG                               _faceMatchedAt;
     ULONGLONG                               _llCreationTime;                                // Timestamp when helper process starts (GetTickCount64)
 
     // Host IPC and lifetime management
@@ -136,6 +137,7 @@ public:
     HRESULT _CreateMessageWindow();
     static LRESULT CALLBACK _MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     void _ResetAuthentication();
+    bool _HasCurrentFaceProof() const;
     HRESULT _ClearPin();
     friend class CredentialTestAccess;
 
@@ -148,6 +150,7 @@ public:
   public:
     void SetProvider(class CSampleProvider* pProvider)
     {
+        if (!pProvider) _ResetAuthentication();
         _pProvider = pProvider;
     }
 };

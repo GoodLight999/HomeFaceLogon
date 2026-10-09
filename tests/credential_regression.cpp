@@ -54,8 +54,17 @@ public:
         SHStrDupW(L"", &c->_rgFieldStrings[SFI_PASSWORD]);
         return c;
     }
-    static void match(CSampleCredential* c) { c->_fFaceAuthSuccess = true; }
+    static void match(CSampleCredential* c) { c->_fFaceAuthSuccess = true; c->_faceMatchedAt = GetTickCount64(); }
+    static void expireMatch(CSampleCredential* c) { c->_faceMatchedAt = GetTickCount64() - 10001; }
     static bool pending(CSampleCredential* c) { return c->_fFaceAuthSuccess || c->_fSubmitting; }
+    static CSampleProvider* attachProvider(CSampleCredential* c) {
+        auto p = new CSampleProvider;
+        p->_pCredential = c;
+        c->AddRef();
+        c->SetProvider(p);
+        return p;
+    }
+    static bool autoLogon(CSampleProvider* p) { return p->_fAutoLogon; }
     static void nonLocal(CSampleCredential* c) {
         c->_fIsLocalUser = false;
         CoTaskMemFree(c->_pszQualifiedUserName);
@@ -169,6 +178,41 @@ int wmain(int argc, wchar_t* argv[]) {
             c->Release();
         }
         std::cout << "PASS face match with partial, invalid, valid and empty PIN\n";
+        auto refreshed = CredentialTestAccess::create();
+        auto provider = CredentialTestAccess::attachProvider(refreshed);
+        refreshed->SetStringValue(SFI_PASSWORD, L"1");
+        CredentialTestAccess::queuedMatch(refreshed);
+        check(CredentialTestAccess::autoLogon(provider), "face match did not request auto logon");
+        refreshed->UnAdvise(); // LogonUI replaces callbacks during asynchronous re-enumeration.
+        check(CredentialTestAccess::autoLogon(provider) && CredentialTestAccess::pending(refreshed),
+            "callback replacement consumed auto logon proof");
+        BOOL refreshedAutoLogon = FALSE;
+        const int launchesBeforeRefresh = hostLaunches;
+        refreshed->SetSelected(&refreshedAutoLogon);
+        check(refreshedAutoLogon && hostLaunches == launchesBeforeRefresh,
+            "refreshed tile restarted camera instead of submitting its face proof");
+        serialize(refreshed, true);
+        refreshed->UnAdvise();
+        check(CredentialTestAccess::pending(refreshed), "callback replacement cancelled in-flight submission");
+        check(serialize(refreshed, false) == S_OK, "callback replacement permitted duplicate submission");
+        provider->Release();
+        check(!CredentialTestAccess::pending(refreshed), "provider teardown retained an orphaned proof");
+        refreshed->Release();
+        std::cout << "PASS auto logon and submission survive callback replacement; teardown cancels proof\n";
+        refreshed = CredentialTestAccess::create();
+        CredentialTestAccess::match(refreshed);
+        refreshed->UnAdvise();
+        CredentialTestAccess::expireMatch(refreshed);
+        refreshedAutoLogon = TRUE;
+        refreshed->SetSelected(&refreshedAutoLogon);
+        check(!refreshedAutoLogon && !CredentialTestAccess::pending(refreshed), "expired proof auto logged on");
+        refreshed->Release();
+        refreshed = CredentialTestAccess::create();
+        CredentialTestAccess::match(refreshed);
+        CredentialTestAccess::expireMatch(refreshed);
+        check(serialize(refreshed, false) == E_ACCESSDENIED, "serialization accepted expired proof");
+        refreshed->Release();
+        std::cout << "PASS old face proof expires before selection or serialization\n";
         auto msa = CredentialTestAccess::create();
         CredentialTestAccess::nonLocal(msa);
         msa->SetStringValue(SFI_PASSWORD, L"1");

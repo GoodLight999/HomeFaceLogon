@@ -13,6 +13,15 @@ It is a **candidate for physical validation**, not a verified Windows unlock rel
   now per credential, cleared on every failure/cancellation, and marked as being
   submitted only after credentials have actually been packaged. Duplicate calls
   and tile reselection cannot launch another camera during submission.
+- **The first physical test exposed an auto-logon refresh loop.** After a match,
+  LogonUI returned `autoLogon=0` without calling serialization and restarted the
+  camera. The candidate was rolled back with enrollment data preserved.
+  `UnAdvise` releases a replaced event callback; it now preserves a pending face
+  proof or submission across that refresh. Selection reports a pending face proof
+  as auto-logon. Actual deselection, failure and provider detachment still clear it.
+  An unused face proof expires after ten seconds, including time spent suspended.
+  A regression reproduces the callback replacement, selection and duplicate-call
+  sequence; reverting only `UnAdvise` makes it fail. Physical retesting is required.
 - **Worker cancellation could outlive the credential.** Pipe workers post to the
   credential's message window. UI/COM updates run on its owning thread. Session
   generations reject queued results after cancellation. Cancellation drains
@@ -35,6 +44,11 @@ It is a **candidate for physical validation**, not a verified Windows unlock rel
   HKLM. Settings writes preserve unknown configuration fields, write atomically,
   and restore the previous file if updating HKLM fails.
   The installer also preserves an existing Enabled value during an upgrade.
+- **Installer registration silently failed.** The DLL exports its COM class
+  factory but no `DllRegisterServer`/`DllUnregisterServer`. The installer now writes
+  the scoped 64-bit COM and credential-provider registrations directly, removes
+  them through its uninstall registry entries, and skips manager launch in silent
+  updates. This was found in the actual upgrade log (regsvr32 exit code 4).
 - **Non-ASCII passwords were read using the wrong encoding.** Redirected setup
   input is explicitly decoded as UTF-8. Invalid UTF-8/NUL is rejected. The manager
   validates line delimiters and PIN format before starting camera work. Input is
@@ -64,6 +78,9 @@ password/PIN loading and a suppressed camera launch. They exercise partial/inval
 valid/empty PINs at face match, Microsoft account packaging, duplicate submission,
 PIN lockout, decryption failure, Windows rejection, stale session delivery,
 pending pipe cancellation, and immediate child exit (10 iterations).
+They also attach a real provider and replace credential callbacks between a
+queued match and selection/serialization, including replacement during submission
+and provider destruction while the credential is retained.
 Replacing only `GetSerialization` with the previous PR version makes the first
 partial-PIN regression fail; the corrected implementation passes the same case.
 

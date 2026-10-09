@@ -35,6 +35,7 @@ CSampleCredential::CSampleCredential():
     _fIsLocalUser(false),
     _fFaceAuthSuccess(false),
     _fSubmitting(false),
+    _faceMatchedAt(0),
     _llCreationTime(0),
     _hHostProcess(INVALID_HANDLE_VALUE),
     _hHostJob(INVALID_HANDLE_VALUE),
@@ -135,6 +136,7 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
 HRESULT CSampleCredential::Advise(_In_ ICredentialProviderCredentialEvents *pcpce)
 {
+    LogInfo(L"Credential Advise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
     if (_pCredProvCredentialEvents != nullptr)
     {
@@ -149,8 +151,12 @@ HRESULT CSampleCredential::Advise(_In_ ICredentialProviderCredentialEvents *pcpc
 // LogonUI calls this to tell us to release the callback.
 HRESULT CSampleCredential::UnAdvise()
 {
+    LogInfo(L"Credential UnAdvise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
-    _ResetAuthentication();
+    // CredentialsChanged re-enumerates the tile and replaces its event callback
+    // before GetCredentialCount/GetSerialization. Releasing that callback must
+    // not consume the face proof or cancel an already packaged submission.
+    if (!_fFaceAuthSuccess && !_fSubmitting) _ResetAuthentication();
     if (_pCredProvCredentialEvents)
     {
         _pCredProvCredentialEvents->Release();
@@ -170,7 +176,9 @@ HRESULT CSampleCredential::UnAdvise()
 // selected, you would do it here.
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
-    *pbAutoLogon = FALSE;
+    if (_fFaceAuthSuccess && !_HasCurrentFaceProof()) _ResetAuthentication();
+    LogInfo(L"Credential SetSelected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
+    *pbAutoLogon = _fFaceAuthSuccess ? TRUE : FALSE;
     if (!_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
     return S_OK;
 }
@@ -180,6 +188,7 @@ HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 // is to clear out the password field.
 HRESULT CSampleCredential::SetDeselected()
 {
+    LogInfo(L"Credential SetDeselected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
     _ResetAuthentication();
 
@@ -399,7 +408,7 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
     if (_fSubmitting) return S_OK;
     _StopHostProcess();
 
-    const bool faceMatched = _fFaceAuthSuccess;
+    const bool faceMatched = _HasCurrentFaceProof();
     _ResetAuthentication(); // Consume the proof once, including every failure path.
 
     HRESULT hr = E_UNEXPECTED;
@@ -913,7 +922,15 @@ void CSampleCredential::_ResetAuthentication()
 {
     _fFaceAuthSuccess = false;
     _fSubmitting = false;
+    _faceMatchedAt = 0;
     if (_pProvider) _pProvider->ResetAutoLogon();
+}
+
+bool CSampleCredential::_HasCurrentFaceProof() const
+{
+    // GetTickCount64 includes suspension: a retained tile cannot reuse a face
+    // match after inactivity or sleep. Callback replacement normally takes ms.
+    return _fFaceAuthSuccess && GetTickCount64() - _faceMatchedAt < 10000;
 }
 
 HRESULT CSampleCredential::_ClearPin()
@@ -1073,6 +1090,7 @@ void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
     case 4: // MSG_MATCHED
         _StopHostProcess();
         _fFaceAuthSuccess = true;
+        _faceMatchedAt = GetTickCount64();
         _UpdateStatusText(L"顔が一致しました。サインインしています...");
         if (_fFaceAuthSuccess && _pProvider) _pProvider->TriggerAutoLogon();
         break;
