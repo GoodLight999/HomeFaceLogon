@@ -9,7 +9,8 @@ use winreg::enums::*;
 use winreg::RegKey;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const SETUP_FILES: [&str; 4] = ["secret.bin", "pin.bin", "config.json", "face.bin"];
+mod setup_transaction;
+use setup_transaction::{atomic_write, transactional_setup, SETUP_FILES};
 static SETUP_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Tauri synchronous commands run on the UI thread. Keep helper waits off that
@@ -43,12 +44,6 @@ pub struct CameraDevice {
     pub name: String,
 }
 
-#[derive(Clone)]
-struct FileSnapshot {
-    path: PathBuf,
-    contents: Option<Vec<u8>>,
-}
-
 fn get_enabled() -> bool {
     let hk = RegKey::predef(HKEY_LOCAL_MACHINE);
     hk.open_subkey("SOFTWARE\\HomeFaceLogon")
@@ -75,6 +70,22 @@ fn config_path() -> Result<PathBuf, String> {
 }
 
 fn find_setup_exe() -> Result<PathBuf, String> {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let adjacent = parent.join("FaceLogonSetup.exe");
+            if adjacent.is_file() { return Ok(adjacent); }
+            // Development builds must use their own helper, not an older install.
+            for ancestor in parent.ancestors() {
+                if ancestor.join("HomeFaceLogon.sln").is_file() {
+                    for configuration in ["Release", "Debug"] {
+                        let candidate = ancestor.join("x64").join(configuration).join("FaceLogonSetup.exe");
+                        if candidate.is_file() { return Ok(candidate); }
+                    }
+                    break;
+                }
+            }
+        }
+    }
     let installed = PathBuf::from(r"C:\Program Files\HomeFaceLogon\FaceLogonSetup.exe");
     if installed.exists() { return Ok(installed); }
     for path in [
@@ -94,12 +105,28 @@ fn find_setup_exe() -> Result<PathBuf, String> {
 
 fn run_setup_process(args: &[String], stdin_content: Option<&str>, timeout: Duration) -> Result<String, String> {
     let setup_exe = find_setup_exe()?;
+    if args.iter().any(|arg| arg == "--data-dir") {
+        let mut probe = Command::new(&setup_exe);
+        probe.arg("--capabilities");
+        let output = run_process(probe, None, Duration::from_secs(15))
+            .map_err(|_| "FaceLogonSetup.exeが古いため、安全に登録できません。管理ツールと設定ツールを一緒に更新してください。".to_string())?;
+        validate_helper_capabilities(&output)?;
+    }
     let mut command = Command::new(&setup_exe);
     command.args(args);
     run_process(command, stdin_content, timeout)
 }
 
+fn validate_helper_capabilities(output: &str) -> Result<(), String> {
+    let capabilities: serde_json::Value = serde_json::from_str(output.trim()).map_err(|e| e.to_string())?;
+    if capabilities["protocolVersion"] != 1 || capabilities["isolatedDataDirectory"] != true {
+        return Err("設定ツールが作業用ディレクトリでの登録に対応していません。".into());
+    }
+    Ok(())
+}
+
 fn run_process(mut command: Command, stdin_content: Option<&str>, timeout: Duration) -> Result<String, String> {
+    let started = Instant::now();
     let mut child = command
         .stdin(if stdin_content.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -115,57 +142,48 @@ fn run_process(mut command: Command, stdin_content: Option<&str>, timeout: Durat
         let mut bytes = Vec::new(); let _ = stream.read_to_end(&mut bytes); bytes
     }));
 
-    if let Some(content) = stdin_content {
+    // A stuck helper may never read stdin. Do not block the timeout supervisor
+    // while writing credentials into a full pipe.
+    let stdin_writer = if let Some(content) = stdin_content {
         let mut stdin = child.stdin.take().ok_or("Failed to open setup stdin")?;
-        if let Err(error) = stdin.write_all(content.as_bytes()) {
-            let _ = child.kill(); let _ = child.wait();
-            return Err(error.to_string());
-        }
-    }
+        let mut bytes = content.as_bytes().to_vec();
+        Some(thread::spawn(move || {
+            let result = stdin.write_all(&bytes);
+            bytes.fill(0);
+            result
+        }))
+    } else { None };
 
-    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(100)),
             Ok(None) => {
                 let _ = child.kill(); let _ = child.wait();
+                if let Some(writer) = stdin_writer { let _ = writer.join(); }
                 let stdout = stdout_reader.and_then(|r| r.join().ok()).unwrap_or_default();
                 let stderr = stderr_reader.and_then(|r| r.join().ok()).unwrap_or_default();
                 return Err(format!("Camera helper timed out after {} seconds and was terminated.\n{}{}",
                     timeout.as_secs(), String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr)));
             }
-            Err(e) => { let _ = child.kill(); let _ = child.wait(); return Err(e.to_string()); }
+            Err(e) => {
+                let _ = child.kill(); let _ = child.wait();
+                if let Some(writer) = stdin_writer { let _ = writer.join(); }
+                return Err(e.to_string());
+            }
         }
     };
 
+    let input_result = match stdin_writer {
+        Some(writer) => writer.join().map_err(|_| "Input writer failed".to_string())?
+            .map_err(|e| format!("Failed to send credentials: {}", e)),
+        None => Ok(()),
+    };
     let stdout = stdout_reader.and_then(|r| r.join().ok()).unwrap_or_default();
     let stderr = stderr_reader.and_then(|r| r.join().ok()).unwrap_or_default();
     let out = String::from_utf8_lossy(&stdout).into_owned();
     let err = String::from_utf8_lossy(&stderr).into_owned();
-    if status.success() { Ok(out) } else if err.trim().is_empty() { Err(out) } else { Err(err) }
-}
-
-fn snapshot_files() -> Result<Vec<FileSnapshot>, String> {
-    let dir = data_dir()?;
-    SETUP_FILES.iter().map(|name| {
-        let path = dir.join(name);
-        let contents = if path.exists() { Some(std::fs::read(&path).map_err(|e| e.to_string())?) } else { None };
-        Ok(FileSnapshot { path, contents })
-    }).collect()
-}
-
-fn restore_files(snapshot: &[FileSnapshot]) -> Result<(), String> {
-    for item in snapshot {
-        match &item.contents {
-            Some(contents) => {
-                if let Some(parent) = item.path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
-                std::fs::write(&item.path, contents).map_err(|e| e.to_string())?;
-            }
-            None => { if item.path.exists() { std::fs::remove_file(&item.path).map_err(|e| e.to_string())?; } }
-        }
-    }
-    Ok(())
+    if status.success() { input_result?; Ok(out) } else if err.trim().is_empty() { Err(out) } else { Err(err) }
 }
 
 fn setup_files_complete() -> bool {
@@ -176,7 +194,7 @@ fn setup_files_complete() -> bool {
 
 #[tauri::command]
 fn get_registry_status() -> Result<RegistryStatus, String> {
-    let mut enabled = get_enabled();
+    let enabled = get_enabled();
     let mut sid = String::new();
     let mut threshold = 0.363;
     let mut required_matches = 3;
@@ -198,7 +216,6 @@ fn get_registry_status() -> Result<RegistryStatus, String> {
         }
     }
     let setup_complete = !sid.is_empty() && setup_files_complete();
-    if enabled && !setup_complete { let _ = set_enabled(false); enabled = false; }
     Ok(RegistryStatus { enabled, sid, threshold, required_matches, window_size,
         scan_timeout_ms, liveness_enabled, camera_index, setup_complete })
 }
@@ -213,16 +230,32 @@ fn set_registry_status(enabled: bool, sid: String, threshold: f64, required_matc
     }
     let path = config_path()?;
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
-    let value = serde_json::json!({
-        "schemaVersion": 1, "enabled": enabled, "targetSid": sid,
-        "matchThreshold": threshold, "requiredMatches": required_matches,
-        "windowSize": window_size, "scanTimeoutMs": scan_timeout_ms,
-        "livenessEnabled": liveness_enabled, "cameraIndex": camera_index,
-        "hostStartupTimeoutMs": 65000, "modelVersion": "1.0"
+    let previous = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut value = match &previous {
+        Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| e.to_string())?,
+        None => serde_json::json!({ "schemaVersion": 1, "hostStartupTimeoutMs": 65000, "modelVersion": "1.0" }),
+    };
+    if !value.is_object() { return Err("Config must be an object".into()); }
+    let updates = serde_json::json!({
+        "enabled": enabled, "targetSid": sid, "matchThreshold": threshold,
+        "requiredMatches": required_matches, "windowSize": window_size,
+        "scanTimeoutMs": scan_timeout_ms, "livenessEnabled": liveness_enabled, "cameraIndex": camera_index,
     });
-    std::fs::write(path, serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    set_enabled(enabled)
+    value.as_object_mut().unwrap().extend(updates.as_object().unwrap().clone());
+    atomic_write(&path, &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?)?;
+    if let Err(error) = set_enabled(enabled) {
+        let restore = match previous {
+            Some(bytes) => atomic_write(&path, &bytes),
+            None => std::fs::remove_file(&path).map_err(|e| e.to_string()),
+        };
+        restore.map_err(|e| format!("{}; failed to restore config: {}", error, e))?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -258,33 +291,74 @@ async fn run_complete_setup(sid: String, password: String, pin: String, camera_i
     background_operation(move || complete_setup(sid, password, pin, camera_index)).await
 }
 
-fn complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
+fn validate_setup_input(sid: &str, password: &str, pin: &str, camera_index: i32) -> Result<(), String> {
     if sid.trim().is_empty() || password.is_empty() || pin.is_empty() {
         return Err("SID、パスワード、PINは必須です。".to_string());
     }
-    let snapshot = snapshot_files()?;
-    let result = (|| {
-        run_setup_process(&["--probe-camera".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(30))?;
-        run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))?;
-        run_setup_process(&["--sid".into(), sid, "--camera".into(), camera_index.to_string()],
-            Some(&format!("{}\n{}\n", password, pin)), Duration::from_secs(30))
-    })();
-    match result {
-        Ok(output) => Ok(output),
-        Err(error) => {
-            let rollback = restore_files(&snapshot);
-            let _ = set_enabled(false);
-            match rollback {
-                Ok(()) => Err(format!("{}\n変更は元の状態へ戻しました。", error)),
-                Err(e) => Err(format!("{}\nロールバックにも失敗しました: {}", error, e)),
-            }
-        }
+    if password.contains(['\r', '\n', '\0']) {
+        return Err("パスワードに改行またはNUL文字を含めることはできません。".to_string());
     }
+    if !(4..=16).contains(&pin.len()) || !pin.bytes().all(|c| (33..=126).contains(&c)) {
+        return Err("PINは4〜16文字の半角英数字・記号（スペース除く）で入力してください。".to_string());
+    }
+    if !sid.starts_with("S-1-") || !sid.bytes().all(|c| c.is_ascii_digit() || c == b'S' || c == b'-') || camera_index < 0 {
+        return Err("SIDまたはカメラ番号が無効です。".to_string());
+    }
+    Ok(())
+}
+
+fn complete_setup(sid: String, password: String, pin: String, camera_index: i32) -> Result<String, String> {
+    validate_setup_input(&sid, &password, &pin, camera_index)?;
+    let dir = data_dir()?;
+    let previous_config = match std::fs::read(dir.join("config.json")) {
+        Ok(bytes) => Some(serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let enabled = get_enabled();
+    transactional_setup(&dir, enabled, set_enabled, |candidate| {
+        let directory = candidate.to_str().ok_or("Invalid setup directory")?.to_string();
+        let common = vec!["--data-dir".to_string(), directory, "--camera".into(), camera_index.to_string()];
+        let run = |mode: &str, timeout: u64| {
+            let mut args = common.clone(); args.push(mode.to_string());
+            run_setup_process(&args, None, Duration::from_secs(timeout))
+        };
+        run("--probe-camera", 30)?;
+        run("--enroll", 180)?;
+        let mut args = common; args.extend(["--sid".into(), sid.clone()]);
+        let output = run_setup_process(&args, Some(&format!("{}\n{}\n", password, pin)), Duration::from_secs(30))?;
+        // Re-registration changes credentials, SID and device. Preserve other settings.
+        let path = candidate.join("config.json");
+        let mut config = match previous_config {
+            Some(value) if value.is_object() => value,
+            Some(_) => return Err("Existing config is not an object".into()),
+            None => serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?,
+        };
+        config["targetSid"] = serde_json::json!(sid);
+        config["cameraIndex"] = serde_json::json!(camera_index);
+        config["enabled"] = serde_json::json!(enabled);
+        atomic_write(&path, &serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)?;
+        Ok(output)
+    })
 }
 
 #[tauri::command]
 async fn run_enroll(camera_index: i32) -> Result<String, String> {
-    background_operation(move || run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string()], None, Duration::from_secs(180))).await
+    background_operation(move || {
+        if !setup_files_complete() { return Err("資格情報とPINを含む初期セットアップを先に完了してください。".into()); }
+        let dir = data_dir()?;
+        let snapshot = setup_transaction::snapshot_files(&dir)?;
+        transactional_setup(&dir, get_enabled(), set_enabled, |candidate| {
+            for item in &snapshot {
+                if let Some(bytes) = &item.contents {
+                    atomic_write(&candidate.join(item.path.file_name().unwrap()), bytes)?;
+                }
+            }
+            run_setup_process(&["--enroll".into(), "--camera".into(), camera_index.to_string(),
+                "--data-dir".into(), candidate.to_str().ok_or("Invalid setup directory")?.into()],
+                None, Duration::from_secs(180))
+        })
+    }).await
 }
 #[tauri::command]
 async fn run_verify(camera_index: i32) -> Result<String, String> {
@@ -361,5 +435,33 @@ mod tests {
         let error = run_process(powershell("[Console]::Error.Write('camera unavailable'); exit 1"),
             None, Duration::from_secs(15)).unwrap_err();
         assert_eq!(error, "camera unavailable");
+    }
+
+    #[test]
+    fn timeout_still_runs_when_helper_does_not_read_stdin() {
+        let input = "x".repeat(100000);
+        let started = Instant::now();
+        let error = run_process(powershell("[Threading.Thread]::Sleep(20000)"),
+            Some(&input), Duration::from_millis(300)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn setup_input_accepts_unicode_but_rejects_protocol_breaking_passwords() {
+        assert!(validate_setup_input("S-1-5-21-123", "テスト🔑", "1234", 0).is_ok());
+        for password in ["a\nb", "a\rb", "a\0b"] {
+            assert!(validate_setup_input("S-1-5-21-123", password, "1234", 0).is_err());
+        }
+        assert!(validate_setup_input("S-1-5-21-123", "dummy", "１２３４", 0).is_err());
+    }
+
+    #[test]
+    fn old_or_incompatible_helper_cannot_run_isolated_enrollment() {
+        assert!(validate_helper_capabilities(r#"{"protocolVersion":1,"isolatedDataDirectory":true}"#).is_ok());
+        for output in ["old helper prompts", "{}", r#"{"protocolVersion":0,"isolatedDataDirectory":true}"#,
+            r#"{"protocolVersion":1,"isolatedDataDirectory":false}"#] {
+            assert!(validate_helper_capabilities(output).is_err());
+        }
     }
 }

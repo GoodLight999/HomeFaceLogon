@@ -20,6 +20,7 @@
 #include <shlguid.h>
 #include <propkey.h>
 #include <stdint.h>
+#include <atomic>
 #include "common.h"
 #include "dll.h"
 #include "resource.h"
@@ -116,6 +117,7 @@ public:
                                                                                             // CredentialEvents2 for Begin and EndFieldUpdates.
     BOOL                                    _fIsLocalUser;                                  // If the cred prov is assosiating with a local user tile
     bool                                    _fFaceAuthSuccess;                              // True if face authentication matched successfully
+    bool                                    _fSubmitting;
     ULONGLONG                               _llCreationTime;                                // Timestamp when helper process starts (GetTickCount64)
 
     // Host IPC and lifetime management
@@ -127,7 +129,15 @@ public:
     HANDLE                                  _hPipeReadThread;
     uint64_t                                _sessionNonceHi;
     uint64_t                                _sessionNonceLo;
-    bool                                    _fScanning;
+    std::atomic<bool>                       _fScanning;
+    HWND                                    _hMessageWindow;
+    std::atomic<UINT_PTR>                   _scanGeneration;
+
+    HRESULT _CreateMessageWindow();
+    static LRESULT CALLBACK _MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    void _ResetAuthentication();
+    HRESULT _ClearPin();
+    friend class CredentialTestAccess;
 
     HRESULT _StartHostProcess();
     void _StopHostProcess();

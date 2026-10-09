@@ -12,6 +12,7 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include "credential_input.h"
 
 // OpenCV headers
 #include <opencv2/opencv.hpp>
@@ -28,6 +29,17 @@
 #pragma comment(lib, "OleAut32.lib")
 
 namespace fs = std::filesystem;
+
+// The manager writes a complete candidate in an isolated directory first.
+static std::wstring g_dataDirectory;
+static HRESULT GetDataDirectory(wchar_t (&path)[MAX_PATH])
+{
+    if (!g_dataDirectory.empty())
+        return StringCchCopyW(path, MAX_PATH, g_dataDirectory.c_str());
+    HRESULT hr = SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path);
+    if (SUCCEEDED(hr) && !PathAppendW(path, L"HomeFaceLogon")) return E_FAIL;
+    return hr;
+}
 
 struct SecretFileHeader {
     uint32_t magic;          // 'HFLO' (0x4F4C4648)
@@ -279,11 +291,10 @@ static double ExtractDouble(const std::string& content, const std::string& key, 
 static bool LoadHostConfig(HostConfig& config)
 {
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    if (FAILED(GetDataDirectory(path)))
     {
         return false;
     }
-    PathAppendW(path, L"HomeFaceLogon");
     PathAppendW(path, L"config.json");
 
     std::ifstream file(path);
@@ -383,13 +394,12 @@ bool SaveSecret(const std::wstring& password)
     }
 
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    if (FAILED(GetDataDirectory(path)))
     {
         SecureZeroMemory(output.pbData, output.cbData);
         LocalFree(output.pbData);
         return false;
     }
-    PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"secret.bin");
 
@@ -454,12 +464,11 @@ bool SavePin(const std::wstring& pin)
     if (!BCRYPT_SUCCESS(status)) return false;
 
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    if (FAILED(GetDataDirectory(path)))
     {
         SecureZeroMemory(derivedKey, sizeof(derivedKey));
         return false;
     }
-    PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"pin.bin");
     const bool ok = WriteFileAtomically(path, [&](std::ofstream& file)
@@ -474,8 +483,7 @@ bool SavePin(const std::wstring& pin)
 bool SaveConfig(const std::wstring& sid, int cameraIndex)
 {
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path))) return false;
-    PathAppendW(path, L"HomeFaceLogon");
+    if (FAILED(GetDataDirectory(path))) return false;
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"config.json");
 
@@ -509,12 +517,11 @@ bool SaveFaceTemplate(const std::vector<float>& featureVec)
                           &output)) return false;
 
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    if (FAILED(GetDataDirectory(path)))
     {
         LocalFree(output.pbData);
         return false;
     }
-    PathAppendW(path, L"HomeFaceLogon");
     CreateDirectoryW(path, nullptr);
     PathAppendW(path, L"face.bin");
     FaceFileHeader header{};
@@ -533,11 +540,10 @@ bool SaveFaceTemplate(const std::vector<float>& featureVec)
 bool LoadFaceTemplate(std::vector<float>& featureVec)
 {
     wchar_t path[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    if (FAILED(GetDataDirectory(path)))
     {
         return false;
     }
-    PathAppendW(path, L"HomeFaceLogon");
     PathAppendW(path, L"face.bin");
 
     std::ifstream file(path, std::ios::in | std::ios::binary);
@@ -710,6 +716,7 @@ bool EnrollFace(int cameraIndex)
         cv::imshow("Face Enrollment - HomeFaceLogon", frame);
 
         // Check if window was closed by user
+        const int key = cv::waitKey(1);
         if (cv::getWindowProperty("Face Enrollment - HomeFaceLogon", cv::WND_PROP_VISIBLE) < 1)
         {
             std::cout << "Enrollment cancelled by closing window." << std::endl;
@@ -717,7 +724,7 @@ bool EnrollFace(int cameraIndex)
             return false;
         }
 
-        if (cv::waitKey(1) == 27)
+        if (key == 27)
         {
             std::cout << "Enrollment cancelled by user." << std::endl;
             cv::destroyAllWindows();
@@ -893,13 +900,14 @@ bool VerifyFace(int cameraIndex)
         }
 
         // Check if window was closed
+        const int key = cv::waitKey(1);
         if (cv::getWindowProperty("Face Verification - HomeFaceLogon", cv::WND_PROP_VISIBLE) < 1)
         {
             std::cout << "Verification stopped by closing window." << std::endl;
             break;
         }
 
-        if (cv::waitKey(1) == 27)
+        if (key == 27)
         {
             std::cout << "Verification cancelled by user." << std::endl;
             break;
@@ -995,90 +1003,44 @@ bool RunDiagnostics()
         dummyTemplate[i] = static_cast<float>(i) / 128.0f;
     }
 
-    // Backup existing face.bin if it exists
-    wchar_t path[MAX_PATH];
-    bool hasBackup = false;
-    std::wstring backupPath;
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    // Exercise DPAPI in memory. Diagnostics must never replace an enrolled face.
+    DATA_BLOB input = {static_cast<DWORD>(dummyTemplate.size() * sizeof(float)),
+        reinterpret_cast<BYTE*>(dummyTemplate.data())};
+    DATA_BLOB encrypted = {};
+    if (!CryptProtectData(&input, L"HomeFaceLogon diagnostic", nullptr, nullptr, nullptr,
+        CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &encrypted))
     {
-        fs::path facePath = fs::path(path) / L"HomeFaceLogon" / L"face.bin";
-        // Ensure parent directory exists for dummy test
-        fs::create_directories(facePath.parent_path());
-        if (fs::exists(facePath))
-        {
-            backupPath = facePath.wstring() + L".bak";
-            try {
-                fs::copy_file(facePath, backupPath, fs::copy_options::overwrite_existing);
-                hasBackup = true;
-            } catch(...) {}
-        }
-    }
-
-    if (!SaveFaceTemplate(dummyTemplate))
-    {
-        std::cerr << "[Diagnostic] ERROR: SaveFaceTemplate failed." << std::endl;
+        std::cerr << "[Diagnostic] ERROR: DPAPI encryption failed." << std::endl;
         return false;
     }
-    std::cout << "[Diagnostic] OK: Dummy face template encrypted and saved." << std::endl;
-
-    std::vector<float> loadedTemplate;
-    if (!LoadFaceTemplate(loadedTemplate))
+    DATA_BLOB decrypted = {};
+    bool ok = CryptUnprotectData(&encrypted, nullptr, nullptr, nullptr, nullptr,
+        CRYPTPROTECT_UI_FORBIDDEN, &decrypted) != FALSE;
+    if (ok) ok = decrypted.cbData == input.cbData &&
+        memcmp(decrypted.pbData, input.pbData, input.cbData) == 0;
+    SecureZeroMemory(encrypted.pbData, encrypted.cbData);
+    LocalFree(encrypted.pbData);
+    if (decrypted.pbData)
     {
-        std::cerr << "[Diagnostic] ERROR: LoadFaceTemplate failed." << std::endl;
+        SecureZeroMemory(decrypted.pbData, decrypted.cbData);
+        LocalFree(decrypted.pbData);
+    }
+    if (!ok)
+    {
+        std::cerr << "[Diagnostic] ERROR: DPAPI round trip failed." << std::endl;
         return false;
     }
-    std::cout << "[Diagnostic] OK: Dummy face template loaded and decrypted." << std::endl;
-
-    if (loadedTemplate.size() != 128)
-    {
-        std::cerr << "[Diagnostic] ERROR: Decrypted template size is incorrect: " << loadedTemplate.size() << std::endl;
-        return false;
-    }
-
-    bool match = true;
-    for (int i = 0; i < 128; ++i)
-    {
-        if (std::abs(loadedTemplate[i] - dummyTemplate[i]) > 1e-5)
-        {
-            match = false;
-            break;
-        }
-    }
-
-    if (!match)
-    {
-        std::cerr << "[Diagnostic] ERROR: Decrypted template values do not match original." << std::endl;
-        return false;
-    }
-    std::cout << "[Diagnostic] OK: Decrypted template values match original dummy values." << std::endl;
-
-    // Restore backup if existed, otherwise delete dummy face.bin
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
-    {
-        fs::path facePath = fs::path(path) / L"HomeFaceLogon" / L"face.bin";
-        if (hasBackup)
-        {
-            try {
-                fs::copy_file(backupPath, facePath, fs::copy_options::overwrite_existing);
-                fs::remove(backupPath);
-                std::cout << "[Diagnostic] Restored original face.bin." << std::endl;
-            } catch(...) {}
-        }
-        else
-        {
-            try {
-                fs::remove(facePath);
-                std::cout << "[Diagnostic] Cleaned up temporary face.bin." << std::endl;
-            } catch(...) {}
-        }
-    }
-
     std::cout << "[Diagnostic] Diagnostic test PASSED." << std::endl;
     return true;
 }
 
 int wmain(int argc, wchar_t* argv[])
 {
+    if (argc == 2 && _wcsicmp(argv[1], L"--capabilities") == 0)
+    {
+        std::cout << "{\"protocolVersion\":1,\"isolatedDataDirectory\":true}" << std::endl;
+        return 0;
+    }
     std::wstring sid;
     std::wstring password;
     std::wstring pin;
@@ -1091,7 +1053,16 @@ int wmain(int argc, wchar_t* argv[])
 
     for (int i = 1; i < argc; ++i)
     {
-        if (_wcsicmp(argv[i], L"--sid") == 0 && i + 1 < argc)
+        if (_wcsicmp(argv[i], L"--data-dir") == 0 && i + 1 < argc)
+        {
+            g_dataDirectory = argv[++i];
+            if (!fs::path(g_dataDirectory).is_absolute() || g_dataDirectory.size() >= MAX_PATH)
+            {
+                std::wcerr << L"--data-dir requires an absolute path shorter than MAX_PATH." << std::endl;
+                return 1;
+            }
+        }
+        else if (_wcsicmp(argv[i], L"--sid") == 0 && i + 1 < argc)
         {
             sid = argv[++i];
         }
@@ -1154,7 +1125,11 @@ int wmain(int argc, wchar_t* argv[])
     if (sid.empty())
     {
         std::wcout << L"Enter Target Windows User SID: ";
-        std::getline(std::wcin, sid);
+        if (!ReadCredentialLine(sid))
+        {
+            std::wcerr << L"Failed to read UTF-8 credential input." << std::endl;
+            return 1;
+        }
         if (!sid.empty() && sid.back() == L'\r')
         {
             sid.pop_back();
@@ -1172,7 +1147,11 @@ int wmain(int argc, wchar_t* argv[])
             SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT));
         }
         
-        std::getline(std::wcin, password);
+        if (!ReadCredentialLine(password))
+        {
+            std::wcerr << L"Failed to read UTF-8 credential input." << std::endl;
+            return 1;
+        }
         if (!password.empty() && password.back() == L'\r')
         {
             password.pop_back();
@@ -1196,7 +1175,11 @@ int wmain(int argc, wchar_t* argv[])
             SetConsoleMode(hStdin, mode & (~ENABLE_ECHO_INPUT));
         }
         
-        std::getline(std::wcin, pin);
+        if (!ReadCredentialLine(pin))
+        {
+            std::wcerr << L"Failed to read UTF-8 credential input." << std::endl;
+            return 1;
+        }
         if (!pin.empty() && pin.back() == L'\r')
         {
             pin.pop_back();

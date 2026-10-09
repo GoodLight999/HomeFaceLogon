@@ -1,16 +1,17 @@
-name: Build camera recovery installer
+name: Build and test authentication lifecycle installer
 
 on:
   workflow_dispatch:
   push:
     branches:
       - agent/camera-recovery-setup-transaction
+      - codex/debug-auth-lifecycle
   pull_request:
     branches:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -21,26 +22,8 @@ jobs:
       - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref || 'agent/camera-recovery-setup-transaction' }}
+          ref: ${{ github.head_ref || github.ref }}
           fetch-depth: 0
-
-      - name: Assemble and apply source patch
-        shell: pwsh
-        run: |
-          $parts = Get-ChildItem tools/camera_fix_parts/part-* | Sort-Object Name
-          $content = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
-          Set-Content -Path tools/apply-camera-recovery-fix.py -Value $content -Encoding utf8NoBOM
-          python -m py_compile tools/apply-camera-recovery-fix.py
-          if (Select-String -Path src/host/main.cpp -Pattern 'struct CameraOpenResult' -Quiet) {
-            python tools/apply-camera-recovery-fix.py
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add src installer tools/apply-camera-recovery-fix.py
-            git commit -m "fix: recover camera lifecycle and transactional setup"
-            git push origin HEAD:agent/camera-recovery-setup-transaction
-          } else {
-            Write-Host "Patch already applied; continuing with build."
-          }
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -69,17 +52,29 @@ jobs:
           & $msbuild HomeFaceLogon.sln /m /p:Configuration=Release /p:Platform=x64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Test credential lifecycle and isolated setup
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          & $msbuild tests/CredentialRegression.vcxproj /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tests/x64/Release/CredentialRegression.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/setup_process_regression.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build Tauri manager
         shell: pwsh
         working-directory: src/gui
         run: |
-          npm install
+          npm ci
           npm run tauri build -- --no-bundle
 
       - name: Test helper timeout and output handling
         shell: pwsh
         working-directory: src/gui/src-tauri
-        run: cargo test --release --lib
+        run: cargo test --release --lib --locked
 
       - name: Ensure Inno Setup
         shell: pwsh
@@ -95,7 +90,7 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: HomeFaceLogon-v0.3.5-camera-recovery
+          name: HomeFaceLogon-v0.3.6-auth-lifecycle
           path: installer_output/*.exe
           if-no-files-found: error
           retention-days: 30

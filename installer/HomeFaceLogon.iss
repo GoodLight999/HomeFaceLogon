@@ -4,12 +4,12 @@
 
 [Setup]
 AppName=HomeFaceLogon
-AppVersion=0.3.5
+AppVersion=0.3.6
 AppPublisher=HomeFaceLogon Team
 DefaultDirName={commonpf}\HomeFaceLogon
 DefaultGroupName=HomeFaceLogon
 OutputDir=..\installer_output
-OutputBaseFilename=HomeFaceLogonSetup-v0.3.5-camera-recovery
+OutputBaseFilename=HomeFaceLogonSetup-v0.3.6-auth-lifecycle
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
@@ -52,7 +52,7 @@ Name: "{commondesktop}\HomeFaceLogon 管理ツール"; Filename: "{app}\HomeFace
 
 [Registry]
 ; Create HomeFaceLogon App Registry Key
-Root: HKLM; Subkey: "SOFTWARE\HomeFaceLogon"; ValueType: dword; ValueName: "Enabled"; ValueData: "0"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\HomeFaceLogon"; ValueType: dword; ValueName: "Enabled"; ValueData: "0"; Flags: createvalueifdoesntexist uninsdeletekey
 Root: HKLM; Subkey: "SOFTWARE\HomeFaceLogon"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
 [Run]

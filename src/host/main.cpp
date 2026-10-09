@@ -131,6 +131,7 @@ bool SendPipeMessage(MessageType type)
             {
                 HostLog("ERROR", "WriteFile timeout/failed in SendPipeMessage. waitRes=%lu", waitRes);
                 CancelIoEx(g_hPipe, &overlapped);
+                GetOverlappedResult(g_hPipe, &overlapped, &bytesWritten, TRUE);
                 ok = FALSE;
             }
         }
@@ -194,6 +195,7 @@ void ReadPipeLoop()
                     {
                         HostLog("ERROR", "WaitForSingleObject failed in ReadPipeLoop: %lu", GetLastError());
                         CancelIoEx(g_hPipe, &overlapped);
+                        GetOverlappedResult(g_hPipe, &overlapped, &bytesRead, TRUE);
                         ok = FALSE;
                         break;
                     }
@@ -201,6 +203,7 @@ void ReadPipeLoop()
                 if (!g_running && ok == FALSE)
                 {
                     CancelIoEx(g_hPipe, &overlapped);
+                    GetOverlappedResult(g_hPipe, &overlapped, &bytesRead, TRUE);
                 }
             }
             else
@@ -929,16 +932,20 @@ int main(int argc, char* argv[])
     HostLog("INFO", "Exiting capture loop. Stopping camera.");
     g_running = false;
     
-    // Close pipe handle to unblock readThread if it's waiting
+    // Cancel and drain the reader before closing its shared pipe handle.
     if (g_hPipe != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(g_hPipe);
-        g_hPipe = INVALID_HANDLE_VALUE;
+        CancelIoEx(g_hPipe, nullptr);
     }
 
     if (readThread.joinable())
     {
         readThread.join();
+    }
+    if (g_hPipe != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_hPipe);
+        g_hPipe = INVALID_HANDLE_VALUE;
     }
 
     HostLog("INFO", "FaceLogonHost exited successfully.");
