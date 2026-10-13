@@ -1,0 +1,96 @@
+name: Build and test authentication lifecycle installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/camera-recovery-setup-transaction
+      - codex/debug-auth-lifecycle
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/gui/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Download OpenCV and face models
+        shell: pwsh
+        run: |
+          ./tools/fetch-opencv.ps1
+          ./tools/fetch-models.ps1
+
+      - name: Build C++ Release x64
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild HomeFaceLogon.sln /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test credential lifecycle and isolated setup
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          & $msbuild tests/CredentialRegression.vcxproj /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tests/x64/Release/CredentialRegression.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/setup_process_regression.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Tauri manager
+        shell: pwsh
+        working-directory: src/gui
+        run: |
+          npm ci
+          npm run tauri build -- --no-bundle
+
+      - name: Test helper timeout and output handling
+        shell: pwsh
+        working-directory: src/gui/src-tauri
+        run: cargo test --release --lib --locked
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\iscc.exe')) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build installer EXE
+        shell: pwsh
+        run: ./tools/build-installer.ps1
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: HomeFaceLogon-v0.3.6-auth-lifecycle
+          path: installer_output/*.exe
+          if-no-files-found: error
+          retention-days: 30

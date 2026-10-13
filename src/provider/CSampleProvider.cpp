@@ -21,6 +21,8 @@
 CSampleProvider::CSampleProvider():
     _cRef(1),
     _pCredential(nullptr),
+    _fRecreateEnumeratedCredentials(false),
+    _cpus(CPUS_INVALID),
     _pCredProviderUserArray(nullptr),
     _pcpe(nullptr),
     _upAdviseContext(0),
@@ -35,6 +37,8 @@ CSampleProvider::~CSampleProvider()
     LogInfo(L"CSampleProvider destructor called.");
     if (_pCredential != nullptr)
     {
+        _pCredential->UnAdvise();
+        _pCredential->SetProvider(nullptr);
         _pCredential->Release();
         _pCredential = nullptr;
     }
@@ -290,6 +294,8 @@ void CSampleProvider::_ReleaseEnumeratedCredentials()
 {
     if (_pCredential != nullptr)
     {
+        _pCredential->UnAdvise();
+        _pCredential->SetProvider(nullptr);
         _pCredential->Release();
         _pCredential = nullptr;
     }

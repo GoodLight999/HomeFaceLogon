@@ -19,9 +19,8 @@
 #include "log.h"
 #include "config.h"
 
-// Tracks if we are currently signing in using face auth to prevent multiple host launches.
-static bool g_fAutoLogonInProgress = false;
-static ULONGLONG g_llLastAuthSuccessTime = 0;
+// Pipe workers only post messages. All credential/COM state belongs to LogonUI's thread.
+static constexpr UINT WM_HOST_MESSAGE = WM_APP + 1;
 
 // Tracks PIN attempts globally across instances to prevent brute force lock bypass by tile toggling
 static int g_nPinAttempts = 0;
@@ -35,6 +34,8 @@ CSampleCredential::CSampleCredential():
     _pszQualifiedUserName(nullptr),
     _fIsLocalUser(false),
     _fFaceAuthSuccess(false),
+    _fSubmitting(false),
+    _faceMatchedAt(0),
     _llCreationTime(0),
     _hHostProcess(INVALID_HANDLE_VALUE),
     _hHostJob(INVALID_HANDLE_VALUE),
@@ -43,7 +44,9 @@ CSampleCredential::CSampleCredential():
     _hPipeReadThread(INVALID_HANDLE_VALUE),
     _sessionNonceHi(0),
     _sessionNonceLo(0),
-    _fScanning(false)
+    _fScanning(false),
+    _hMessageWindow(nullptr),
+    _scanGeneration(0)
 {
     DllAddRef();
 
@@ -55,6 +58,9 @@ CSampleCredential::CSampleCredential():
 CSampleCredential::~CSampleCredential()
 {
     _StopHostProcess();
+    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
+    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+    if (_pCredProvCredentialEvents) _pCredProvCredentialEvents->Release();
 
     if (_rgFieldStrings[SFI_PASSWORD])
     {
@@ -117,6 +123,10 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
     }
     if (SUCCEEDED(hr))
     {
+        hr = SHStrDupW(L"顔認証（HomeFaceLogon）", &_rgFieldStrings[SFI_PROVIDER_LABEL]);
+    }
+    if (SUCCEEDED(hr))
+    {
         hr = pcpUser->GetStringValue(PKEY_Identity_QualifiedUserName, &_pszQualifiedUserName);
     }
     if (SUCCEEDED(hr))
@@ -130,22 +140,35 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
 HRESULT CSampleCredential::Advise(_In_ ICredentialProviderCredentialEvents *pcpce)
 {
+    LogInfo(L"Credential Advise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
+    _StopHostProcess();
     if (_pCredProvCredentialEvents != nullptr)
     {
         _pCredProvCredentialEvents->Release();
     }
-    return pcpce->QueryInterface(IID_PPV_ARGS(&_pCredProvCredentialEvents));
+    _pCredProvCredentialEvents = nullptr;
+    HRESULT hr = _CreateMessageWindow();
+    if (SUCCEEDED(hr)) hr = pcpce->QueryInterface(IID_PPV_ARGS(&_pCredProvCredentialEvents));
+    return hr;
 }
 
 // LogonUI calls this to tell us to release the callback.
 HRESULT CSampleCredential::UnAdvise()
 {
+    LogInfo(L"Credential UnAdvise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
+    // CredentialsChanged re-enumerates the tile and replaces its event callback
+    // before GetCredentialCount/GetSerialization. Releasing that callback must
+    // not consume the face proof or cancel an already packaged submission.
+    if (!_fFaceAuthSuccess && !_fSubmitting) _ResetAuthentication();
     if (_pCredProvCredentialEvents)
     {
         _pCredProvCredentialEvents->Release();
     }
     _pCredProvCredentialEvents = nullptr;
+    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
+    _hMessageWindow = nullptr;
+    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
     return S_OK;
 }
 
@@ -157,8 +180,10 @@ HRESULT CSampleCredential::UnAdvise()
 // selected, you would do it here.
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
-    *pbAutoLogon = FALSE;
-    _StartHostProcess();
+    if (_fFaceAuthSuccess && !_HasCurrentFaceProof()) _ResetAuthentication();
+    LogInfo(L"Credential SetSelected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
+    *pbAutoLogon = _fFaceAuthSuccess ? TRUE : FALSE;
+    if (!_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
     return S_OK;
 }
 
@@ -167,7 +192,9 @@ HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 // is to clear out the password field.
 HRESULT CSampleCredential::SetDeselected()
 {
+    LogInfo(L"Credential SetDeselected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
+    _ResetAuthentication();
 
     HRESULT hr = S_OK;
     if (_rgFieldStrings[SFI_PASSWORD])
@@ -238,7 +265,9 @@ HRESULT CSampleCredential::GetBitmapValue(DWORD dwFieldID, _Outptr_result_nullon
 
     if ((SFI_TILEIMAGE == dwFieldID))
     {
-        HBITMAP hbmp = LoadBitmap(HINST_THISDLL, MAKEINTRESOURCE(IDB_TILE_IMAGE));
+        // Keep the 32-bit alpha channel in the provider logo.
+        HBITMAP hbmp = static_cast<HBITMAP>(LoadImageW(HINST_THISDLL,
+            MAKEINTRESOURCEW(IDB_TILE_IMAGE), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION));
         if (hbmp != nullptr)
         {
             hr = S_OK;
@@ -353,7 +382,8 @@ HRESULT CSampleCredential::CommandLinkClicked(DWORD dwFieldID)
         if (dwFieldID == SFI_LAUNCHWINDOW_LINK)
         {
             _StopHostProcess();
-            _StartHostProcess();
+            _ResetAuthentication();
+            hr = _StartHostProcess();
         }
         else
         {
@@ -377,28 +407,28 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                                             _Out_ CREDENTIAL_PROVIDER_STATUS_ICON *pcpsiOptionalStatusIcon)
 {
     LogInfo(L"GetSerialization called: _fIsLocalUser=%d, QualifiedUserName='%s'", _fIsLocalUser, _pszQualifiedUserName ? _pszQualifiedUserName : L"NULL");
-    _StopHostProcess();
-
-    if (_fFaceAuthSuccess)
-    {
-        g_fAutoLogonInProgress = true;
-        g_llLastAuthSuccessTime = GetTickCount64();
-    }
-
-    HRESULT hr = E_UNEXPECTED;
     *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
     ZeroMemory(pcpcs, sizeof(*pcpcs));
+    if (_fSubmitting) return S_OK;
+    _StopHostProcess();
 
-    // Check lockout first
-    if (g_nPinAttempts >= 5)
+    const bool faceMatched = _HasCurrentFaceProof();
+    _ResetAuthentication(); // Consume the proof once, including every failure path.
+
+    HRESULT hr = E_UNEXPECTED;
+
+    // PIN lockout applies to PIN attempts, not an independent, successful face match.
+    if (!faceMatched && g_nPinAttempts >= 5)
     {
         ULONGLONG now = GetTickCount64();
         if (now < g_lockoutExpiration)
         {
             *ppwszOptionalStatusText = nullptr;
             SHStrDupW(L"PIN の入力に何度も失敗したため、一時的にロックされています。30秒後に再試行してください。", ppwszOptionalStatusText);
+            _ClearPin();
+            _StartHostProcess();
             return E_ACCESSDENIED;
         }
         else
@@ -410,8 +440,14 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
 
     bool authValid = false;
 
-    // Case 1: User submitted a PIN (password field is not empty)
-    if (_rgFieldStrings[SFI_PASSWORD] && _rgFieldStrings[SFI_PASSWORD][0] != L'\0')
+    // A match may arrive while the user is typing. An unfinished PIN must never
+    // override that match or count as a failed PIN attempt.
+    if (faceMatched)
+    {
+        authValid = true;
+        _ClearPin();
+    }
+    else if (_rgFieldStrings[SFI_PASSWORD] && _rgFieldStrings[SFI_PASSWORD][0] != L'\0')
     {
         if (VerifyPin(_rgFieldStrings[SFI_PASSWORD]))
         {
@@ -435,25 +471,17 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
                 SHStrDupW(szErr, ppwszOptionalStatusText);
             }
             // Clear the password field in the UI
-            CoTaskMemFree(_rgFieldStrings[SFI_PASSWORD]);
-            SHStrDupW(L"", &_rgFieldStrings[SFI_PASSWORD]);
-            if (_pCredProvCredentialEvents)
-            {
-                _pCredProvCredentialEvents->SetFieldString(this, SFI_PASSWORD, _rgFieldStrings[SFI_PASSWORD]);
-            }
+            _ClearPin();
+            _StartHostProcess(); // Keep face authentication available after PIN failure.
             return E_ACCESSDENIED;
         }
-    }
-    // Case 2: Auto-logon triggered by successful face auth
-    else if (_fFaceAuthSuccess)
-    {
-        authValid = true;
     }
     // Case 3: Neither PIN entered nor face auth succeeded (user just clicked submit button with empty PIN field)
     else
     {
         *ppwszOptionalStatusText = nullptr;
         SHStrDupW(L"PIN を入力するか、顔認証を行ってください。", ppwszOptionalStatusText);
+        _StartHostProcess();
         return E_ACCESSDENIED;
     }
 
@@ -553,7 +581,20 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
         CoTaskMemFree(pwzDecryptedPassword);
     }
 
-    _fFaceAuthSuccess = false;
+    if (FAILED(hr))
+    {
+        if (pcpcs->rgbSerialization)
+        {
+            SecureZeroMemory(pcpcs->rgbSerialization, pcpcs->cbSerialization);
+            CoTaskMemFree(pcpcs->rgbSerialization);
+        }
+        ZeroMemory(pcpcs, sizeof(*pcpcs));
+    }
+    else if (*pcpgsr == CPGSR_RETURN_CREDENTIAL_FINISHED)
+    {
+        _fSubmitting = true;
+        _ClearPin();
+    }
 
     LogInfo(L"GetSerialization finished: hr=0x%08X, pcpgsr=%d, cbSerialization=%lu, ulAuthPackage=%lu", 
             hr, *pcpgsr, pcpcs->cbSerialization, pcpcs->ulAuthenticationPackage);
@@ -610,16 +651,12 @@ HRESULT CSampleCredential::ReportResult(NTSTATUS ntsStatus,
     }
 
     // Reset face auth success flag
-    _fFaceAuthSuccess = false;
+    _ResetAuthentication();
 
     // If we failed the logon, try to erase the password field.
     if (FAILED(HRESULT_FROM_NT(ntsStatus)))
     {
-        g_fAutoLogonInProgress = false; // Reset lock on logon failure
-        if (_pCredProvCredentialEvents)
-        {
-            _pCredProvCredentialEvents->SetFieldString(this, SFI_PASSWORD, L"");
-        }
+        _ClearPin();
     }
 
     // Since nullptr is a valid value for *ppwszOptionalStatusText and *pcpsiOptionalStatusIcon
@@ -665,19 +702,13 @@ HRESULT CSampleCredential::GetFieldOptions(DWORD dwFieldID,
 
 HRESULT CSampleCredential::_StartHostProcess()
 {
-    // If auto-logon is currently in progress, skip launching host to prevent duplicate camera usage
-    if (g_fAutoLogonInProgress)
+    // This state is scoped to the current credential and cleared on all failures/cancellation.
+    if (_fFaceAuthSuccess || _fSubmitting)
     {
-        if (GetTickCount64() - g_llLastAuthSuccessTime < 15000) // 15s window
-        {
-            LogInfo(L"Auto-logon is in progress. Skipping helper process startup.");
-            return S_OK;
-        }
-        else
-        {
-            g_fAutoLogonInProgress = false;
-        }
+        return S_OK;
     }
+    HRESULT windowHr = _CreateMessageWindow();
+    if (FAILED(windowHr)) return windowHr;
 
     LogInfo(L"Starting FaceLogonHost helper process...");
     _llCreationTime = GetTickCount64();
@@ -735,19 +766,32 @@ HRESULT CSampleCredential::_StartHostProcess()
     _hPipeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (_hPipeEvent == nullptr)
     {
-        LogError(L"CreateEventW failed for _hPipeEvent: %lu", GetLastError());
+        DWORD error = GetLastError();
+        LogError(L"CreateEventW failed for _hPipeEvent: %lu", error);
         CloseHandle(_hPipe);
         _hPipe = INVALID_HANDLE_VALUE;
-        return HRESULT_FROM_WIN32(GetLastError());
+        return HRESULT_FROM_WIN32(error);
     }
 
     // 3. Create Job Object to tie host life to Winlogon/CP
     _hHostJob = CreateJobObjectW(nullptr, nullptr);
-    if (_hHostJob != nullptr)
+    if (_hHostJob == nullptr)
+    {
+        DWORD error = GetLastError();
+        _hHostJob = INVALID_HANDLE_VALUE;
+        _StopHostProcess();
+        return HRESULT_FROM_WIN32(error);
+    }
+    else
     {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
         jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(_hHostJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        if (!SetInformationJobObject(_hHostJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)))
+        {
+            DWORD error = GetLastError();
+            _StopHostProcess();
+            return HRESULT_FROM_WIN32(error);
+        }
     }
 
     // 4. Resolve host executable path
@@ -810,16 +854,11 @@ HRESULT CSampleCredential::_StartHostProcess()
 
     if (!ok)
     {
-        LogError(L"CreateProcessW failed: %lu", GetLastError());
-        CloseHandle(_hPipe);
-        _hPipe = INVALID_HANDLE_VALUE;
-        if (_hHostJob != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(_hHostJob);
-            _hHostJob = INVALID_HANDLE_VALUE;
-        }
+        DWORD error = GetLastError();
+        LogError(L"CreateProcessW failed: %lu", error);
+        _StopHostProcess();
         _UpdateStatusText(L"ヘルパープロセスの起動に失敗しました");
-        return HRESULT_FROM_WIN32(GetLastError());
+        return HRESULT_FROM_WIN32(error);
     }
 
     _hHostProcess = pi.hProcess;
@@ -827,7 +866,12 @@ HRESULT CSampleCredential::_StartHostProcess()
 
     if (_hHostJob != INVALID_HANDLE_VALUE)
     {
-        AssignProcessToJobObject(_hHostJob, _hHostProcess);
+        if (!AssignProcessToJobObject(_hHostJob, _hHostProcess))
+        {
+            DWORD error = GetLastError();
+            _StopHostProcess();
+            return HRESULT_FROM_WIN32(error);
+        }
     }
 
     _fScanning = true;
@@ -835,244 +879,210 @@ HRESULT CSampleCredential::_StartHostProcess()
 
     // 6. Start Named Pipe Read Thread
     _hPipeReadThread = CreateThread(nullptr, 0, _PipeReadThreadProc, this, 0, nullptr);
+    if (!_hPipeReadThread)
+    {
+        DWORD error = GetLastError();
+        _hPipeReadThread = INVALID_HANDLE_VALUE;
+        _StopHostProcess();
+        return HRESULT_FROM_WIN32(error);
+    }
     
     _UpdateStatusText(L"カメラを準備しています...");
     return S_OK;
 }
 
+HRESULT CSampleCredential::_CreateMessageWindow()
+{
+    if (_hMessageWindow) return S_OK;
+    const wchar_t* className = L"HomeFaceLogonCredentialEvents";
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = _MessageWindowProc;
+    wc.hInstance = HINST_THISDLL;
+    wc.lpszClassName = className;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return HRESULT_FROM_WIN32(GetLastError());
+    _hMessageWindow = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, HINST_THISDLL, this);
+    return _hMessageWindow ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+}
+
+LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto credential = reinterpret_cast<CSampleCredential*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE)
+    {
+        credential = static_cast<CSampleCredential*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(credential));
+    }
+    if (message == WM_HOST_MESSAGE && credential)
+    {
+        // Queued results from a stopped/replaced camera session must not sign in.
+        if (wParam == credential->_scanGeneration && credential->_fScanning)
+            credential->_HandlePipeMessage(static_cast<uint16_t>(lParam));
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void CSampleCredential::_ResetAuthentication()
+{
+    _fFaceAuthSuccess = false;
+    _fSubmitting = false;
+    _faceMatchedAt = 0;
+    if (_pProvider) _pProvider->ResetAutoLogon();
+}
+
+bool CSampleCredential::_HasCurrentFaceProof() const
+{
+    // GetTickCount64 includes suspension: a retained tile cannot reuse a face
+    // match after inactivity or sleep. Callback replacement normally takes ms.
+    return _fFaceAuthSuccess && GetTickCount64() - _faceMatchedAt < 10000;
+}
+
+HRESULT CSampleCredential::_ClearPin()
+{
+    if (_rgFieldStrings[SFI_PASSWORD])
+    {
+        SecureZeroMemory(_rgFieldStrings[SFI_PASSWORD], wcslen(_rgFieldStrings[SFI_PASSWORD]) * sizeof(wchar_t));
+        CoTaskMemFree(_rgFieldStrings[SFI_PASSWORD]);
+        _rgFieldStrings[SFI_PASSWORD] = nullptr;
+    }
+    HRESULT hr = SHStrDupW(L"", &_rgFieldStrings[SFI_PASSWORD]);
+    if (SUCCEEDED(hr) && _pCredProvCredentialEvents)
+        _pCredProvCredentialEvents->SetFieldString(this, SFI_PASSWORD, L"");
+    return hr;
+}
+
 void CSampleCredential::_StopHostProcess()
 {
     _fScanning = false;
+    ++_scanGeneration;
+    if (_hPipeEvent) SetEvent(_hPipeEvent);
+    if (_hPipe != INVALID_HANDLE_VALUE) CancelIoEx(_hPipe, nullptr);
 
-    // Signal the thread to cancel
-    if (_hPipeEvent != nullptr)
+    // Worker code never invokes COM or waits for the UI. Keep its pipe, event,
+    // nonce and object alive until cancellation has completed and it has exited.
+    if (_hPipeReadThread != INVALID_HANDLE_VALUE)
     {
-        SetEvent(_hPipeEvent);
+        WaitForSingleObject(_hPipeReadThread, INFINITE);
+        CloseHandle(_hPipeReadThread);
+        _hPipeReadThread = INVALID_HANDLE_VALUE;
     }
-
-    // 1. Terminate or Shutdown Host Process
     if (_hHostProcess != INVALID_HANDLE_VALUE)
     {
-        // Try sending MSG_SHUTDOWN message to pipe before force-killing
-        if (_hPipe != INVALID_HANDLE_VALUE)
-        {
-            struct MessageHeader {
-                uint32_t magic;
-                uint16_t version;
-                uint16_t type;
-                uint32_t payloadSize;
-                uint64_t sessionNonceHi;
-                uint64_t sessionNonceLo;
-            } header = {};
-            header.magic = 0x4F4C4648; // 'HFLO'
-            header.version = 1;
-            header.type = 8; // MSG_SHUTDOWN
-            header.sessionNonceHi = _sessionNonceHi;
-            header.sessionNonceLo = _sessionNonceLo;
-
-            DWORD bytesWritten = 0;
-            OVERLAPPED writeOverlapped = {};
-            writeOverlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (writeOverlapped.hEvent != nullptr)
-            {
-                WriteFile(_hPipe, &header, sizeof(header), &bytesWritten, &writeOverlapped);
-                // Wait briefly for write to complete
-                WaitForSingleObject(writeOverlapped.hEvent, 50);
-                CloseHandle(writeOverlapped.hEvent);
-            }
-        }
-
-        // Force kill if necessary after brief delay, or just let Job Object handle it
         TerminateProcess(_hHostProcess, 0);
         CloseHandle(_hHostProcess);
         _hHostProcess = INVALID_HANDLE_VALUE;
     }
-
-    // 2. Clean up Job Object
     if (_hHostJob != INVALID_HANDLE_VALUE)
     {
         CloseHandle(_hHostJob);
         _hHostJob = INVALID_HANDLE_VALUE;
     }
-
-    // 3. Cancel and Close Named Pipe
     if (_hPipe != INVALID_HANDLE_VALUE)
     {
-        CancelIoEx(_hPipe, nullptr);
         DisconnectNamedPipe(_hPipe);
         CloseHandle(_hPipe);
         _hPipe = INVALID_HANDLE_VALUE;
     }
-
-    // 4. Wait for Read Thread
-    if (_hPipeReadThread != INVALID_HANDLE_VALUE)
-    {
-        WaitForSingleObject(_hPipeReadThread, 200);
-        CloseHandle(_hPipeReadThread);
-        _hPipeReadThread = INVALID_HANDLE_VALUE;
-    }
-
-    // 5. Clean up pipe event
-    if (_hPipeEvent != nullptr)
+    if (_hPipeEvent)
     {
         CloseHandle(_hPipeEvent);
         _hPipeEvent = nullptr;
     }
-
     _sessionNonceHi = 0;
     _sessionNonceLo = 0;
 }
 
+static ULONGLONG AwakeMilliseconds()
+{
+    ULONGLONG time = 0;
+    QueryUnbiasedInterruptTime(&time);
+    return time / 10000;
+}
+
 DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
 {
-    CSampleCredential* pThis = reinterpret_cast<CSampleCredential*>(lpParam);
-    if (!pThis) return 0;
+    auto pThis = static_cast<CSampleCredential*>(lpParam);
+    // These handles and fields remain stable until this worker has been joined.
+    const UINT_PTR generation = pThis->_scanGeneration;
+    const HANDLE pipe = pThis->_hPipe;
+    const HANDLE cancel = pThis->_hPipeEvent;
+    const HWND window = pThis->_hMessageWindow;
+    auto post = [&](uint16_t type) { PostMessageW(window, WM_HOST_MESSAGE, generation, type); };
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) { post(6); return 0; }
 
-    LogInfo(L"Pipe read thread started.");
-
-    HANDLE hConnectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hConnectEvent)
-    {
-        LogError(L"Failed to create hConnectEvent: %lu", GetLastError());
-        return 0;
-    }
-
-    OVERLAPPED connectOverlapped = {};
-    connectOverlapped.hEvent = hConnectEvent;
-
-    // ConnectNamedPipe using overlapped I/O
-    BOOL connected = FALSE;
-    if (ConnectNamedPipe(pThis->_hPipe, &connectOverlapped))
-    {
-        connected = TRUE;
-    }
-    else
-    {
-        DWORD err = GetLastError();
-        if (err == ERROR_PIPE_CONNECTED)
+    // Cancellation wins over a simultaneously completed I/O. Always drain an
+    // OVERLAPPED operation before its stack buffer or event goes out of scope.
+    const ULONGLONG started = AwakeMilliseconds();
+    AppConfig config = {};
+    LoadAppConfig(&config);
+    const ULONGLONG timeout = 65000ULL + static_cast<ULONGLONG>(config.scanTimeoutMs > 0 ? config.scanTimeoutMs : 10000);
+    auto complete = [&](OVERLAPPED& ov, DWORD& bytes) -> bool {
+        HANDLE handles[] = {cancel, event, pThis->_hHostProcess};
+        while (pThis->_fScanning)
         {
-            connected = TRUE;
+            DWORD result = WaitForMultipleObjects(ARRAYSIZE(handles), handles, FALSE, 100);
+            if (result == WAIT_OBJECT_0 + 1)
+                return GetOverlappedResult(pipe, &ov, &bytes, FALSE) != FALSE;
+            // If the child exited simultaneously, give its final pipe write
+            // a chance to complete; cancellation must still win.
+            if (result == WAIT_OBJECT_0 + 2 && WaitForSingleObject(event, 0) == WAIT_OBJECT_0)
+                return GetOverlappedResult(pipe, &ov, &bytes, FALSE) != FALSE;
+            if (result != WAIT_TIMEOUT || AwakeMilliseconds() - started >= timeout) break;
         }
-        else if (err == ERROR_IO_PENDING)
-        {
-            // Wait for connection or cancellation event
-            HANDLE waitHandles[2] = { hConnectEvent, pThis->_hPipeEvent };
-            DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-            if (waitRes == WAIT_OBJECT_0)
-            {
-                DWORD bytesTransferred = 0;
-                if (GetOverlappedResult(pThis->_hPipe, &connectOverlapped, &bytesTransferred, FALSE))
-                {
-                    connected = TRUE;
-                }
-                else
-                {
-                    LogError(L"GetOverlappedResult for ConnectNamedPipe failed: %lu", GetLastError());
-                }
-            }
-            else
-            {
-                LogInfo(L"ConnectNamedPipe wait canceled or pipe event signaled.");
-                CancelIoEx(pThis->_hPipe, &connectOverlapped);
-            }
-        }
-        else
-        {
-            LogError(L"ConnectNamedPipe failed: %lu", err);
-        }
-    }
-
-    CloseHandle(hConnectEvent);
-
-    if (!connected || !pThis->_fScanning)
-    {
-        LogInfo(L"Pipe connection not established or scanning stopped. Thread exiting.");
-        return 0;
-    }
-
-    LogInfo(L"Pipe client connected.");
-
-    struct MessageHeader {
-        uint32_t magic;
-        uint16_t version;
-        uint16_t type;
-        uint32_t payloadSize;
-        uint64_t sessionNonceHi;
-        uint64_t sessionNonceLo;
+        CancelIoEx(pipe, &ov);
+        GetOverlappedResult(pipe, &ov, &bytes, TRUE);
+        return false;
     };
 
-    HANDLE hReadEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hReadEvent)
+    OVERLAPPED ov = {};
+    ov.hEvent = event;
+    DWORD bytes = 0;
+    bool connected = ConnectNamedPipe(pipe, &ov) != FALSE;
+    if (!connected)
     {
-        LogError(L"Failed to create hReadEvent: %lu", GetLastError());
-        return 0;
+        DWORD error = GetLastError();
+        connected = error == ERROR_PIPE_CONNECTED || (error == ERROR_IO_PENDING && complete(ov, bytes));
     }
-
-    OVERLAPPED readOverlapped = {};
-    readOverlapped.hEvent = hReadEvent;
-
-    while (pThis->_fScanning)
+    if (connected)
     {
-        MessageHeader header = {};
-        DWORD bytesRead = 0;
-        ResetEvent(hReadEvent);
-        
-        BOOL ok = ReadFile(pThis->_hPipe, &header, sizeof(header), &bytesRead, &readOverlapped);
-        if (!ok)
+        struct MessageHeader {
+            uint32_t magic;
+            uint16_t version;
+            uint16_t type;
+            uint32_t payloadSize;
+            uint64_t sessionNonceHi;
+            uint64_t sessionNonceLo;
+        };
+        while (pThis->_fScanning)
         {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING)
+            MessageHeader header = {};
+            ResetEvent(event);
+            ov = {};
+            ov.hEvent = event;
+            bytes = 0;
+            bool read = ReadFile(pipe, &header, sizeof(header), &bytes, &ov) != FALSE;
+            if (!read && GetLastError() == ERROR_IO_PENDING) read = complete(ov, bytes);
+            if (!read || bytes != sizeof(header)) break;
+            if (!pThis->_fScanning) break;
+            if (header.magic != 0x4F4C4648 || header.version != 1 || header.payloadSize != 0 ||
+                header.sessionNonceHi != pThis->_sessionNonceHi || header.sessionNonceLo != pThis->_sessionNonceLo)
             {
-                HANDLE waitHandles[2] = { hReadEvent, pThis->_hPipeEvent };
-                DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-                if (waitRes == WAIT_OBJECT_0)
-                {
-                    if (GetOverlappedResult(pThis->_hPipe, &readOverlapped, &bytesRead, FALSE))
-                    {
-                        ok = TRUE;
-                    }
-                    else
-                    {
-                        // Read failed
-                        break;
-                    }
-                }
-                else
-                {
-                    LogInfo(L"ReadFile wait canceled or pipe event signaled.");
-                    CancelIoEx(pThis->_hPipe, &readOverlapped);
-                    break;
-                }
-            }
-            else
-            {
-                // Other error
+                LogError(L"Invalid host message; stopping this session.");
                 break;
             }
-        }
-
-        if (ok && bytesRead == sizeof(header))
-        {
-            if (header.magic == 0x4F4C4648 &&
-                header.sessionNonceHi == pThis->_sessionNonceHi &&
-                header.sessionNonceLo == pThis->_sessionNonceLo)
+            post(header.type);
+            if (header.type >= 4 && header.type <= 7)
             {
-                pThis->_HandlePipeMessage(header.type);
+                CloseHandle(event);
+                return 0;
             }
-            else
-            {
-                LogError(L"Received message with invalid magic or session nonce.");
-            }
-        }
-        else
-        {
-            // Incomplete read or error
-            break;
         }
     }
-
-    CloseHandle(hReadEvent);
-    LogInfo(L"Pipe read thread exiting.");
+    if (pThis->_fScanning) post(6);
+    CloseHandle(event);
     return 0;
 }
 
@@ -1084,33 +1094,22 @@ void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
         _UpdateStatusText(L"顔を探しています...");
         break;
     case 4: // MSG_MATCHED
-        _UpdateStatusText(L"顔が一致しました。サインインしています...");
+        _StopHostProcess();
         _fFaceAuthSuccess = true;
-        g_fAutoLogonInProgress = true;
-        g_llLastAuthSuccessTime = GetTickCount64();
-        if (_pProvider != nullptr)
-        {
-            // スリープ解除直後など、LogonUIが完全にアクティブ化する前に
-            // TriggerAutoLogon を呼び出すと無視されてハングする現象を防ぐため、
-            // ホストプロセス開始から最低 1200ms 経過するのを保証する。
-            ULONGLONG elapsed = GetTickCount64() - _llCreationTime;
-            const ULONGLONG TARGET_ACTIVE_DELAY = 1200;
-            if (elapsed < TARGET_ACTIVE_DELAY)
-            {
-                ULONGLONG sleepTime = TARGET_ACTIVE_DELAY - elapsed;
-                if (sleepTime > 1000) sleepTime = 1000;
-                Sleep(static_cast<DWORD>(sleepTime));
-            }
-            _pProvider->TriggerAutoLogon();
-        }
+        _faceMatchedAt = GetTickCount64();
+        _UpdateStatusText(L"顔が一致しました。サインインしています...");
+        if (_fFaceAuthSuccess && _pProvider) _pProvider->TriggerAutoLogon();
         break;
     case 5: // MSG_NO_MATCH
+        _StopHostProcess();
         _UpdateStatusText(L"登録された顔と一致しません");
         break;
     case 6: // MSG_CAMERA_ERROR
+        _StopHostProcess();
         _UpdateStatusText(L"カメラを開けませんでした。カメラが他のアプリに使用されていないか確認してください。");
         break;
     case 7: // MSG_MODEL_ERROR
+        _StopHostProcess();
         _UpdateStatusText(L"顔認識モデルの初期化に失敗しました。");
         break;
     default:

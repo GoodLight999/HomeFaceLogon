@@ -1,0 +1,180 @@
+    std::wstring name;
+};
+
+static std::vector<CameraDeviceInfo> EnumerateCameraDevices()
+{
+    std::vector<CameraDeviceInfo> devices;
+    ComApartment com;
+    if (!com.Ok()) return devices;
+
+    ICreateDevEnum* deviceEnumerator = nullptr;
+    IEnumMoniker* monikerEnumerator = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&deviceEnumerator));
+    if (FAILED(hr) || deviceEnumerator == nullptr) return devices;
+
+    hr = deviceEnumerator->CreateClassEnumerator(
+        CLSID_VideoInputDeviceCategory, &monikerEnumerator, 0);
+    if (hr != S_OK || monikerEnumerator == nullptr)
+    {
+        deviceEnumerator->Release();
+        return devices;
+    }
+
+    IMoniker* moniker = nullptr;
+    ULONG fetched = 0;
+    int index = 0;
+    while (monikerEnumerator->Next(1, &moniker, &fetched) == S_OK)
+    {
+        std::wstring name = L"Camera " + std::to_wstring(index);
+        IPropertyBag* propertyBag = nullptr;
+        if (SUCCEEDED(moniker->BindToStorage(nullptr, nullptr,
+                                             IID_PPV_ARGS(&propertyBag))) &&
+            propertyBag != nullptr)
+        {
+            VARIANT value;
+            VariantInit(&value);
+            if (SUCCEEDED(propertyBag->Read(L"FriendlyName", &value, nullptr)) &&
+                value.vt == VT_BSTR && value.bstrVal != nullptr)
+            {
+                name = value.bstrVal;
+            }
+            VariantClear(&value);
+            propertyBag->Release();
+        }
+        for (wchar_t& ch : name)
+        {
+            if (ch == L'\t' || ch == L'\r' || ch == L'\n') ch = L' ';
+        }
+        devices.push_back({index, name});
+        ++index;
+        moniker->Release();
+    }
+
+    monikerEnumerator->Release();
+    deviceEnumerator->Release();
+    return devices;
+}
+
+static bool IsCameraIndexAvailable(int cameraIndex, std::wstring* friendlyName = nullptr)
+{
+    for (const auto& device : EnumerateCameraDevices())
+    {
+        if (device.index == cameraIndex)
+        {
+            if (friendlyName != nullptr) *friendlyName = device.name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void PrintCameraDevices()
+{
+    for (const auto& device : EnumerateCameraDevices())
+    {
+        std::wcout << device.index << L"\t" << device.name << std::endl;
+    }
+}
+
+'''
+setup = replace_once(setup, 'static void ConfigureCameraProperties(cv::VideoCapture& cap)\n', camera_enum + 'static void ConfigureCameraProperties(cv::VideoCapture& cap)\n', 'camera enumeration')
+setup = replace_once(setup, '''static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    const int MAX_RETRIES = 3;''', '''static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
+{
+    std::wstring friendlyName;
+    if (!IsCameraIndexAvailable(cameraIndex, &friendlyName))
+    {
+        std::wcerr << L"Error: Camera index " << cameraIndex
+                   << L" is not present. Refresh the camera list and choose a named device."
+                   << std::endl;
+        return false;
+    }
+    std::wcout << L"Selected camera: [" << cameraIndex << L"] "
+               << friendlyName << std::endl;
+
+    const int MAX_RETRIES = 3;''', 'camera index validation')
+
+atomic_helper = r'''template <typename Writer>
+static bool WriteFileAtomically(const std::wstring& finalPath, Writer writer)
+{
+    const std::wstring tempPath = finalPath + L".tmp." + std::to_wstring(GetCurrentProcessId());
+    {
+        std::ofstream file(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) return false;
+        writer(file);
+        file.flush();
+        if (!file.good())
+        {
+            file.close();
+            DeleteFileW(tempPath.c_str());
+            return false;
+        }
+    }
+    if (!MoveFileExW(tempPath.c_str(), finalPath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+'''
+setup = replace_once(setup, 'bool SaveSecret(const std::wstring& password)\n', atomic_helper + 'bool SaveSecret(const std::wstring& password)\n', 'atomic writer')
+
+save_secret = r'''bool SaveSecret(const std::wstring& password)
+{
+    DATA_BLOB input;
+    input.pbData = reinterpret_cast<BYTE*>(const_cast<wchar_t*>(password.c_str()));
+    input.cbData = static_cast<DWORD>((password.length() + 1) * sizeof(wchar_t));
+    DATA_BLOB output = {0};
+    if (!CryptProtectData(&input, L"HomeFaceLogon MSA password", nullptr, nullptr,
+                          nullptr, CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+                          &output))
+    {
+        std::wcerr << L"CryptProtectData failed: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    wchar_t path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, path)))
+    {
+        SecureZeroMemory(output.pbData, output.cbData);
+        LocalFree(output.pbData);
+        return false;
+    }
+    PathAppendW(path, L"HomeFaceLogon");
+    CreateDirectoryW(path, nullptr);
+    PathAppendW(path, L"secret.bin");
+
+    SecretFileHeader header{};
+    header.magic = HFLO_MAGIC;
+    header.schemaVersion = 1;
+    header.protectedBlobSize = output.cbData;
+    const bool ok = WriteFileAtomically(path, [&](std::ofstream& file)
+    {
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(output.pbData), output.cbData);
+    });
+    SecureZeroMemory(output.pbData, output.cbData);
+    LocalFree(output.pbData);
+    return ok;
+}
+
+'''
+setup = replace_span(setup, 'bool SaveSecret(const std::wstring& password)', 'struct PinFileHeader', save_secret, 'SaveSecret')
+
+save_pin = r'''bool SavePin(const std::wstring& pin)
+{
+    if (pin.empty()) return false;
+    PinFileHeader header = {};
+    header.magic = HFLP_MAGIC;
+    header.schemaVersion = 1;
+    header.iterations = 100000;
+    NTSTATUS status = BCryptGenRandom(nullptr, header.salt, sizeof(header.salt),
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) return false;
+

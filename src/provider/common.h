@@ -23,7 +23,8 @@ enum SAMPLE_FIELD_ID
     SFI_SUBMIT_BUTTON     = 3,
     SFI_LAUNCHWINDOW_LINK = 4,  // "Retry face scan" link
     SFI_LOGONSTATUS_TEXT  = 5,
-    SFI_NUM_FIELDS        = 6,
+    SFI_PROVIDER_LABEL    = 6,  // Sign-in option tooltip; not an extra visible form row.
+    SFI_NUM_FIELDS        = 7,
 };
 
 // The first value indicates when the tile is displayed (selected, not selected)
@@ -43,6 +44,7 @@ static const FIELD_STATE_PAIR s_rgFieldStatePairs[] =
     { CPFS_DISPLAY_IN_SELECTED_TILE,   CPFIS_NONE    },    // SFI_SUBMIT_BUTTON
     { CPFS_DISPLAY_IN_SELECTED_TILE,   CPFIS_NONE    },    // SFI_LAUNCHWINDOW_LINK
     { CPFS_DISPLAY_IN_SELECTED_TILE,   CPFIS_NONE    },    // SFI_LOGONSTATUS_TEXT
+    { CPFS_HIDDEN,                     CPFIS_NONE    },    // SFI_PROVIDER_LABEL
 };
 
 // Field descriptors for unlock and logon.
@@ -54,4 +56,5 @@ static const CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR s_rgCredProvFieldDescriptors[]
     { SFI_SUBMIT_BUTTON,     CPFT_SUBMIT_BUTTON,  L"\x30B5\x30A4\x30F3\x30A4\x30F3"                            },  // "サインイン"
     { SFI_LAUNCHWINDOW_LINK, CPFT_COMMAND_LINK,   L"\x9854\x7167\x5408\x3092\x518D\x8A66\x884C"                },  // "顔照合を再試行"
     { SFI_LOGONSTATUS_TEXT,  CPFT_SMALL_TEXT,     L"\x30AB\x30E1\x30E9\x306E\x6E96\x5099\x4E2D..."             },  // "カメラの準備中..."
+    { SFI_PROVIDER_LABEL,    CPFT_SMALL_TEXT,     L"顔認証（HomeFaceLogon）",       CPFG_CREDENTIAL_PROVIDER_LABEL },
 };

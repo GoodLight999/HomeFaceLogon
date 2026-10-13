@@ -84,6 +84,7 @@ class CSampleProvider : public ICredentialProvider,
     }
 
     friend HRESULT CSample_CreateInstance(_In_ REFIID riid, _Outptr_ void** ppv);
+    friend class CredentialTestAccess;
 
   protected:
     CSampleProvider();
