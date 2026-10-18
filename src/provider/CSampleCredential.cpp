@@ -1091,6 +1091,10 @@ DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
 
 void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
 {
+    // End-to-end latency as the user sees it, including antivirus scans that
+    // run before the host process exists (invisible to the host's own log).
+    LogInfo(L"Host message type=%u, %llu ms after host launch request",
+            msgType, GetTickCount64() - _llCreationTime);
     switch (msgType)
     {
     case 3: // MSG_STATUS

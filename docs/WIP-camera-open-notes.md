@@ -44,13 +44,35 @@
 
 対策（このブランチで追加）:
 - `installer/HomeFaceLogon.iss` の `[Run]` でインストール直後に `FaceLogonSetup.exe --capabilities` を実行し、Defender スキャンを先に済ませる
-- `src/host/main.cpp` の起動ログに「プロセス生成→main 到達」のミリ秒を出す（ログの時刻は秒単位なので、ローダー時間とカメラ時間を分けるため）
+- `src/host/main.cpp` の起動ログに「プロセス生成→main 到達」のミリ秒を出す
+  - 注意: Defender の exe スキャンはプロセス生成**前**に走るのでこの値には出ない（ビルド直後の実測: 接続まで 4.1 秒でもこの値は 79ms）
+- `src/provider/CSampleCredential.cpp`: Host からのメッセージごとに「起動要求からの経過 ms」を `FaceLogon.log` に出す。ロック画面での体感時間はこちらで見る
+
+## 偽パイプでの Host 通しテスト（2026-10-18, ユーザーセッション）
+CP と同じ手順（message モードのパイプ + nonce）で Host を起動し、STATUS / MATCHED を受け取るスクリプトで計測。
+- 通常: **起動→MATCHED 1.5〜1.7 秒**（10 回中 10 回成功）。旧版はカメラ open だけで 4.7〜7 秒
+- カメラアプリが前面でカメラを使用中: MSMF/DSHOW とも取れない（Windows の排他。旧版も同じ）
+- カメラアプリ使用中に Host 起動 → 3 秒後にアプリ終了:
+  - 修正前: 解放→MATCHED 4.2〜6.2 秒、しかも 1 回の DSHOW 成功でキャッシュが **DSHOW に固定**された（ロック画面で遅い方）
+  - 修正後: 解放→MATCHED **1.6〜2.8 秒**、キャッシュは MSMF のまま
+
+見つかって直したもの:
+- 使用中に開いた MSMF セッションは、カメラ解放後もフレームを返さない → MSMF が「開けたがフレーム無し」なら DSHOW に行く前に MSMF を 1 回開き直す。MSMF の最初のフレーム待ちは 3 秒に短縮（通常 0.9〜1.05 秒）
+- キャッシュの降格条件: DSHOW 優先にするのは「MSMF 失敗→DSHOW 成功」が 2 セッション連続した時だけ。DSHOW 優先でも 10 セッションごとに MSMF を再試行（`src/common/camera_preference.h`、回帰テストあり）
+- Advise 変更の回帰テストを追加（旧コードに戻すと FAIL することを確認済み）
 
 ## TODO（次回）
 1. ~~初回だけ 6.5 秒かかる原因~~ → 上記で解決（Defender 初回スキャン + コールドキャッシュ）
-2. インストールしてロック画面で実機テスト（Advise 変更の効果、カメラの二重起動が無くなったか、MSMF の open/first frame 時間、`process start -> main` の値）
+2. インストールしてロック画面で実機テスト（下の「リリース判定」参照）
 3. 最初のフレームまで約 1 秒かかる点の短縮余地を確認
-4. インストーラーを再ビルド（Release は 2026-10-18 に再ビルド済み、`.iss` も更新済み）
+4. ~~インストーラーを再ビルド~~
+
+## リリース判定（ロック画面でしか確認できないもの）
+- Host が SYSTEM / LogonUI 配下でも MSMF で開けるか（`FaceLogonHost.log` の `MSMF first frame`）
+- 起動→MATCHED が数秒以内か（`FaceLogon.log` の `Host message type=4, N ms after host launch request`）
+- スリープ復帰直後でも MSMF が速いか
+- カメラアプリを開いたままロック → 顔認証できるか
+- カメラが二重起動しないか（`FaceLogon.log` で Advise 後に `Starting FaceLogonHost` が 1 回だけ）
 
 ## 備考
 - `dist/` は未追跡のビルド成果物（約 68MB）なのでコミットしていない
