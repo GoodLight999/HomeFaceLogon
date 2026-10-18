@@ -326,3 +326,11 @@ pwsh tools/build-installer.ps1
    ```cmd
    reg unload HKLM\TempSoftware
    ```
+
+---
+
+### License
+
+Licensed under the **Apache License 2.0**.
+
+MIT and GPL were also considered, but Apache won because it has the coolest name.
