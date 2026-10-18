@@ -12,6 +12,7 @@
 #include <ctime>
 #include <cstdarg>
 #include <opencv2/opencv.hpp>
+#include "../common/camera_capture.h"
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -409,28 +410,9 @@ struct ComApartment
     }
 };
 
-static void ConfigureCameraProperties(cv::VideoCapture& cap)
-{
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, kCameraWidth);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, kCameraHeight);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-}
-
-static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayMs = 100)
-{
-    ULONGLONG warmupStart = GetTickCount64();
-    for (int attempt = 0; attempt < maxAttempts; ++attempt)
-    {
-        if (cap.grab())
-        {
-            HostLog("INFO", "Camera warm-up succeeded: attempts=%d, elapsed=%llums", attempt + 1, GetTickCount64() - warmupStart);
-            return true;
-        }
-        Sleep(delayMs);
-    }
-    HostLog("WARNING", "Camera warm-up failed: attempts=%d, elapsed=%llums", maxAttempts, GetTickCount64() - warmupStart);
-    return false;
-}
+// Backend selection, resolution and first-frame wait live in
+// common/camera_capture.h so enrollment (setup) and sign-in (host) open the
+// camera identically.
 
 // Camera open and retry logic runs entirely on a single worker thread to avoid
 // DirectShow device lock contention.  The main thread waits for the result with
@@ -457,8 +439,8 @@ static ULONGLONG GetAwakeMilliseconds()
 static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
 {
     const DWORD OVERALL_TIMEOUT_MS = 60000;
-    const int MAX_RETRIES = 8;
-    const int RETRY_DELAY_MS = 1500;
+    const int MAX_RETRIES = 6;       // each attempt tries every usable backend
+    const int RETRY_DELAY_MS = 1000;
 
     std::atomic<bool> finished{false};
     const ULONGLONG startAwakeMs = GetAwakeMilliseconds();
@@ -479,62 +461,24 @@ static bool OpenCameraWithRetry(cv::VideoCapture& cap, int cameraIndex, int& wid
         }
     });
 
-    bool success = false;
-    for (int attempt = 1; attempt <= MAX_RETRIES && g_running; ++attempt)
+    hfl_camera::OpenOptions options;
+    options.maxAttempts = MAX_RETRIES;
+    options.retryDelayMs = RETRY_DELAY_MS;
+    options.firstFrameTimeoutMs = 5000;
+    options.shouldContinue = []() { return g_running.load(); };
+    wchar_t cachePath[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, cachePath)))
     {
-        const bool allowFallback = (attempt >= MAX_RETRIES - 2);
-        HostLog("INFO", "Opening camera index %d (attempt %d/%d, allowFallback=%s)...",
-                cameraIndex, attempt, MAX_RETRIES,
-                allowFallback ? "true" : "false");
+        PathAppendW(cachePath, L"HomeFaceLogon");
+        PathAppendW(cachePath, L"camera_backend.txt");
+        options.preferenceCachePath = cachePath;
+    }
 
-        ULONGLONG backendStart = GetAwakeMilliseconds();
-        cap.open(cameraIndex, cv::CAP_DSHOW);
-        HostLog("INFO", "CAP_DSHOW finished: opened=%d, awakeElapsed=%llums",
-                cap.isOpened(), GetAwakeMilliseconds() - backendStart);
-
-        if (!cap.isOpened() && allowFallback)
-        {
-            backendStart = GetAwakeMilliseconds();
-            cap.open(cameraIndex, cv::CAP_MSMF);
-            HostLog("INFO", "CAP_MSMF finished: opened=%d, awakeElapsed=%llums",
-                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
-        }
-
-        if (!cap.isOpened() && attempt == MAX_RETRIES)
-        {
-            backendStart = GetAwakeMilliseconds();
-            cap.open(cameraIndex);
-            HostLog("INFO", "Default backend finished: opened=%d, awakeElapsed=%llums",
-                    cap.isOpened(), GetAwakeMilliseconds() - backendStart);
-        }
-
-        if (cap.isOpened())
-        {
-            ConfigureCameraProperties(cap);
-            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-            if (width <= 0 || height <= 0)
-            {
-                width = kCameraWidth;
-                height = kCameraHeight;
-            }
-
-            const int warmAttempts = (attempt < MAX_RETRIES) ? 12 : 40;
-            if (WarmUpCamera(cap, warmAttempts, 100))
-            {
-                HostLog("INFO", "Camera opened and streaming successfully (%dx%d).", width, height);
-                success = true;
-                break;
-            }
-
-            HostLog("WARNING", "Camera opened but did not stream. Releasing before retry.");
-            cap.release();
-        }
-
-        if (attempt < MAX_RETRIES)
-        {
-            Sleep(RETRY_DELAY_MS);
-        }
+    const bool success = hfl_camera::OpenCamera(cap, cameraIndex, options, HostLog, width, height);
+    if (success)
+    {
+        HostLog("INFO", "Camera opened and streaming successfully (%dx%d), awakeElapsed=%llums.",
+                width, height, GetAwakeMilliseconds() - startAwakeMs);
     }
 
     finished.store(true);
@@ -582,9 +526,25 @@ static bool LoadHostConfig(HostConfig& config)
     return true;
 }
 
+// Time from process creation to main(): DLL loading, including antivirus scans
+// of opencv_world on first use. Log timestamps have 1 s resolution, so this is
+// the only way to tell loader cost apart from camera cost at the lock screen.
+static long long GetMsSinceProcessCreation()
+{
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER c, n;
+    c.LowPart = created.dwLowDateTime; c.HighPart = created.dwHighDateTime;
+    n.LowPart = now.dwLowDateTime;     n.HighPart = now.dwHighDateTime;
+    return static_cast<long long>((n.QuadPart - c.QuadPart) / 10000ULL);
+}
+
 int main(int argc, char* argv[])
 {
-    HostLog("INFO", "FaceLogonHost helper process starting...");
+    HostLog("INFO", "FaceLogonHost helper process starting (process start -> main: %lld ms)...",
+            GetMsSinceProcessCreation());
+    hfl_camera::ConfigureOpenCvCameraEnvironment();
 
     // Parse arguments
     int cameraIndex = 0;
@@ -780,6 +740,7 @@ int main(int argc, char* argv[])
             config.matchThreshold, config.requiredMatches, config.windowSize, config.scanTimeoutMs, config.livenessEnabled ? "true" : "false");
 
     int framesCount = 0;
+    int consecutiveEmptyFrames = 0;
     ULONGLONG startTime = GetTickCount64();
 
     cv::Mat prevGray;
@@ -808,9 +769,21 @@ int main(int argc, char* argv[])
         cap >> frame;
         if (frame.empty())
         {
-            HostLog("ERROR", "Empty frame grabbed.");
+            // Transient drops happen (USB bandwidth, MSMF sample timeout).
+            // Only treat sustained loss as a camera failure.
+            if (++consecutiveEmptyFrames < 15)
+            {
+                Sleep(30);
+                continue;
+            }
+            HostLog("ERROR", "Empty frame grabbed %d times in a row.", consecutiveEmptyFrames);
             SendPipeMessage(MSG_CAMERA_ERROR);
             break;
+        }
+        if (consecutiveEmptyFrames > 0)
+        {
+            HostLog("WARNING", "Recovered after %d empty frame(s).", consecutiveEmptyFrames);
+            consecutiveEmptyFrames = 0;
         }
 
         framesCount++;

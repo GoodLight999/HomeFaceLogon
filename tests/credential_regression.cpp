@@ -7,6 +7,7 @@
 #include <thread>
 #include "../src/provider/config.h"
 #include "../src/setup/credential_input.h"
+#include "../src/common/camera_preference.h"
 
 static int pinChecks = 0;
 static int hostLaunches = 0;
@@ -115,6 +116,17 @@ public:
         check(GetTickCount64() - started < 1000, "pipe cancellation did not finish promptly");
         if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
     }
+    static void adviseDuringScan(CSampleCredential* c, ICredentialProviderCredentialEvents* events) {
+        check(SUCCEEDED(c->_CreateMessageWindow()), "event window failed");
+        c->_fScanning = true;
+        const UINT_PTR generation = c->_scanGeneration;
+        c->Advise(events); // LogonUI may (re)issue Advise after SetSelected started the camera.
+        check(c->_fScanning && c->_scanGeneration == generation, "Advise stopped the running camera session");
+        PostMessageW(c->_hMessageWindow, WM_HOST_MESSAGE, generation, 4);
+        MSG message;
+        while (PeekMessageW(&message, c->_hMessageWindow, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
+        check(c->_fFaceAuthSuccess, "match after Advise was not delivered");
+    }
     static void childExit(CSampleCredential* c) {
         check(SUCCEEDED(c->_CreateMessageWindow()), "event window failed");
         wchar_t name[128];
@@ -138,6 +150,27 @@ public:
         while (PeekMessageW(&message, c->_hMessageWindow, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
         check(c->_fFaceAuthSuccess, "final match was lost when child exited");
     }
+};
+
+// Minimal LogonUI callback: only identity matters for Advise ordering tests.
+class TestEvents : public ICredentialProviderCredentialEvents {
+public:
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == __uuidof(ICredentialProviderCredentialEvents)) { *ppv = this; return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return 1; }
+    IFACEMETHODIMP_(ULONG) Release() override { return 1; }
+    IFACEMETHODIMP SetFieldState(ICredentialProviderCredential*, DWORD, CREDENTIAL_PROVIDER_FIELD_STATE) override { return S_OK; }
+    IFACEMETHODIMP SetFieldInteractiveState(ICredentialProviderCredential*, DWORD, CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE) override { return S_OK; }
+    IFACEMETHODIMP SetFieldString(ICredentialProviderCredential*, DWORD, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP SetFieldCheckbox(ICredentialProviderCredential*, DWORD, BOOL, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP SetFieldBitmap(ICredentialProviderCredential*, DWORD, HBITMAP) override { return S_OK; }
+    IFACEMETHODIMP SetFieldComboBoxSelectedItem(ICredentialProviderCredential*, DWORD, DWORD) override { return S_OK; }
+    IFACEMETHODIMP DeleteFieldComboBoxItem(ICredentialProviderCredential*, DWORD, DWORD) override { return S_OK; }
+    IFACEMETHODIMP AppendFieldComboBoxItem(ICredentialProviderCredential*, DWORD, LPCWSTR) override { return S_OK; }
+    IFACEMETHODIMP SetFieldSubmitButton(ICredentialProviderCredential*, DWORD, DWORD) override { return S_OK; }
+    IFACEMETHODIMP OnCreatingWindow(HWND* hwnd) override { *hwnd = nullptr; return S_OK; }
 };
 
 static HRESULT serialize(CSampleCredential* c, bool expectFinished) {
@@ -270,6 +303,31 @@ int wmain(int argc, wchar_t* argv[]) {
             c->Release();
         }
         std::cout << "PASS final match survives immediate child exit (10 iterations)\n";
+        TestEvents events;
+        c = CredentialTestAccess::create();
+        CredentialTestAccess::adviseDuringScan(c, &events);
+        c->Release();
+        std::cout << "PASS Advise during an active scan keeps the camera session and its result\n";
+        {
+            using namespace hfl_camera;
+            Preference pref; // first run: MSMF by default
+            pref = NextPreference(pref, true, Backend::DSHOW); // camera busy once
+            check(pref.backend == Backend::MSMF && pref.streak == 1, "one fallback demoted MSMF");
+            pref = NextPreference(pref, true, Backend::MSMF);
+            check(pref.backend == Backend::MSMF && pref.streak == 0, "MSMF success did not reset fallbacks");
+            pref = NextPreference(NextPreference(pref, true, Backend::DSHOW), true, Backend::DSHOW);
+            check(pref.backend == Backend::DSHOW && pref.streak == 0, "repeated MSMF failure did not prefer DSHOW");
+            for (int i = 1; i < kDshowSessionsBeforeRetry; ++i) pref = NextPreference(pref, true, Backend::DSHOW);
+            check(pref.backend == Backend::DSHOW, "DSHOW preference expired early");
+            pref = NextPreference(pref, true, Backend::DSHOW);
+            check(pref.backend == Backend::MSMF, "MSMF was never retried");
+            check(NextPreference(pref, true, Backend::DSHOW).backend == Backend::DSHOW,
+                "MSMF retry on a DSHOW-only device was not demoted after one slow session");
+            pref = Preference{};
+            check(NextPreference(pref, false, Backend::DSHOW).backend == Backend::DSHOW,
+                "unmappable camera must use DSHOW");
+        }
+        std::cout << "PASS camera backend preference survives transient contention\n";
         for (auto bytes : {std::string("ascii\n"), std::string("\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88\xF0\x9F\x94\x91\r\n")}) {
             std::istringstream stream(bytes); std::wstring value;
             check(ReadUtf8CredentialLine(stream, value) && !value.empty(), "UTF-8 input rejected");

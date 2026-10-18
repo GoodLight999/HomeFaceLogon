@@ -140,8 +140,11 @@ HRESULT CSampleCredential::Initialize(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
 // LogonUI calls this in order to give us a callback in case we need to notify it of anything.
 HRESULT CSampleCredential::Advise(_In_ ICredentialProviderCredentialEvents *pcpce)
 {
-    LogInfo(L"Credential Advise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
-    _StopHostProcess();
+    LogInfo(L"Credential Advise: face=%d, submitting=%d, scanning=%d", _fFaceAuthSuccess, _fSubmitting, _fScanning.load() ? 1 : 0);
+    // Do not stop a running host here. LogonUI may call SetSelected before
+    // (or re-issue) Advise; killing the session here caused the camera to
+    // start, stop, and restart. The message window survives Advise, so an
+    // in-flight scan keeps delivering results. UnAdvise still stops it.
     if (_pCredProvCredentialEvents != nullptr)
     {
         _pCredProvCredentialEvents->Release();
@@ -1088,6 +1091,10 @@ DWORD WINAPI CSampleCredential::_PipeReadThreadProc(LPVOID lpParam)
 
 void CSampleCredential::_HandlePipeMessage(uint16_t msgType)
 {
+    // End-to-end latency as the user sees it, including antivirus scans that
+    // run before the host process exists (invisible to the host's own log).
+    LogInfo(L"Host message type=%u, %llu ms after host launch request",
+            msgType, GetTickCount64() - _llCreationTime);
     switch (msgType)
     {
     case 3: // MSG_STATUS
