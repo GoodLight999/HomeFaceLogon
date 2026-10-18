@@ -4,12 +4,12 @@
 
 [Setup]
 AppName=HomeFaceLogon
-AppVersion=0.3.6
+AppVersion=0.3.7
 AppPublisher=HomeFaceLogon Team
 DefaultDirName={commonpf}\HomeFaceLogon
 DefaultGroupName=HomeFaceLogon
 OutputDir=..\installer_output
-OutputBaseFilename=HomeFaceLogonSetup-v0.3.6-auth-lifecycle
+OutputBaseFilename=HomeFaceLogonSetup-v0.3.7-camera-speedup
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
@@ -68,8 +68,10 @@ Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\
 ; here (~3.5 s measured) instead of during the first lock-screen sign-in.
 ; --capabilities only prints a JSON line and touches no data.
 Filename: "{app}\FaceLogonSetup.exe"; Parameters: "--capabilities"; StatusMsg: "初回起動の準備をしています..."; Flags: runhidden waituntilterminated
-; Launch the Tauri setup wizard manager at the end of installation
-Filename: "{app}\HomeFaceLogon.exe"; Description: "HomeFaceLogon 管理ツールを起動して初期セットアップを行う"; Flags: postinstall nowait skipifsilent
+; Launch the Tauri setup wizard manager at the end of installation.
+; The manager's manifest requires administrator rights, and postinstall entries
+; otherwise run as the original non-elevated user, which fails to start it.
+Filename: "{app}\HomeFaceLogon.exe"; Description: "HomeFaceLogon 管理ツールを起動して初期セットアップを行う"; Flags: postinstall nowait skipifsilent runascurrentuser
 
 [UninstallDelete]
 Type: files; Name: "{commonappdata}\HomeFaceLogon\config.json"

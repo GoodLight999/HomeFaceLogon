@@ -1,12 +1,10 @@
-# WIP: カメラ起動処理の共通化（作業メモ）
+# カメラ起動の高速化（v0.3.7 検証記録）
 
-最終更新: 2026-10-18 / ブランチ `agent/camera-capture-common`
+最終更新: 2026-10-18 / v0.3.7 でリリース（ブランチ `agent/camera-capture-common`）
 
 ## 状態
-- ビルド: Debug / Release とも成功（未インストール）
-- `FaceLogonSetup` でのカメラプローブ: 3回連続成功（`--data-dir` に一時フォルダを指定、本番 ProgramData は未変更）
-- **ロック画面（Credential Provider → Host）の実機テストは未実施**
-- インストーラー（`HomeFaceLogon.iss`）は再ビルドしていない
+- ロック画面での実機テストで高速化を確認済み（2026-10-18, Logicool C270）
+- C++ / Rust の回帰テスト、偽パイプでの Host 通しテストに成功
 
 ## 変更内容
 - `src/common/camera_capture.h`（新規）: Host / Setup 共通のカメラオープン処理
@@ -61,18 +59,17 @@ CP と同じ手順（message モードのパイプ + nonce）で Host を起動�
 - キャッシュの降格条件: DSHOW 優先にするのは「MSMF 失敗→DSHOW 成功」が 2 セッション連続した時だけ。DSHOW 優先でも 10 セッションごとに MSMF を再試行（`src/common/camera_preference.h`、回帰テストあり）
 - Advise 変更の回帰テストを追加（旧コードに戻すと FAIL することを確認済み）
 
-## TODO（次回）
+## 残課題
 1. ~~初回だけ 6.5 秒かかる原因~~ → 上記で解決（Defender 初回スキャン + コールドキャッシュ）
-2. インストールしてロック画面で実機テスト（下の「リリース判定」参照）
+2. ~~ロック画面での実機テスト~~ → 確認済み
 3. 最初のフレームまで約 1 秒かかる点の短縮余地を確認
 4. ~~インストーラーを再ビルド~~
 
-## リリース判定（ロック画面でしか確認できないもの）
-- Host が SYSTEM / LogonUI 配下でも MSMF で開けるか（`FaceLogonHost.log` の `MSMF first frame`）
-- 起動→MATCHED が数秒以内か（`FaceLogon.log` の `Host message type=4, N ms after host launch request`）
-- スリープ復帰直後でも MSMF が速いか
-- カメラアプリを開いたままロック → 顔認証できるか
-- カメラが二重起動しないか（`FaceLogon.log` で Advise 後に `Starting FaceLogonHost` が 1 回だけ）
+## ロック画面での実機確認（2026-10-18 17:32, v0.3.7 相当のビルドをインストール）
+- 確認済み: Host は LogonUI 配下（SYSTEM）でも MSMF で開けた（open→最初のフレーム 1503ms、`process start -> main` 39ms）
+- 確認済み: Host 起動要求→顔一致 **1969ms**（`FaceLogon.log` の `Host message type=4`）。旧版はカメラ open だけで 4.7〜7 秒
+- 確認済み: Host の起動は 1 回だけ（Advise による停止→再起動なし）
+- 未確認（ロック画面では未実施）: スリープ復帰直後、カメラアプリを開いたままのロック、再起動直後の初回
 
 ## 備考
 - `dist/` は未追跡のビルド成果物（約 68MB）なのでコミットしていない
