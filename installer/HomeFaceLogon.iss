@@ -64,6 +64,10 @@ Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{{5fd3d285-0dd9-4362-8855-e0abaacd
 Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{{5fd3d285-0dd9-4362-8855-e0abaacd4af6}"; ValueType: string; ValueName: ""; ValueData: "HomeFaceLogon Credential Provider"; Flags: uninsdeletekey
 
 [Run]
+; Load the freshly installed binaries once so antivirus scans the ~64MB OpenCV DLL
+; here (~3.5 s measured) instead of during the first lock-screen sign-in.
+; --capabilities only prints a JSON line and touches no data.
+Filename: "{app}\FaceLogonSetup.exe"; Parameters: "--capabilities"; StatusMsg: "初回起動の準備をしています..."; Flags: runhidden waituntilterminated
 ; Launch the Tauri setup wizard manager at the end of installation
 Filename: "{app}\HomeFaceLogon.exe"; Description: "HomeFaceLogon 管理ツールを起動して初期セットアップを行う"; Flags: postinstall nowait skipifsilent
 

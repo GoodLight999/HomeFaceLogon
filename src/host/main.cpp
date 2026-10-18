@@ -526,9 +526,24 @@ static bool LoadHostConfig(HostConfig& config)
     return true;
 }
 
+// Time from process creation to main(): DLL loading, including antivirus scans
+// of opencv_world on first use. Log timestamps have 1 s resolution, so this is
+// the only way to tell loader cost apart from camera cost at the lock screen.
+static long long GetMsSinceProcessCreation()
+{
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER c, n;
+    c.LowPart = created.dwLowDateTime; c.HighPart = created.dwHighDateTime;
+    n.LowPart = now.dwLowDateTime;     n.HighPart = now.dwHighDateTime;
+    return static_cast<long long>((n.QuadPart - c.QuadPart) / 10000ULL);
+}
+
 int main(int argc, char* argv[])
 {
-    HostLog("INFO", "FaceLogonHost helper process starting...");
+    HostLog("INFO", "FaceLogonHost helper process starting (process start -> main: %lld ms)...",
+            GetMsSinceProcessCreation());
     hfl_camera::ConfigureOpenCvCameraEnvironment();
 
     // Parse arguments
