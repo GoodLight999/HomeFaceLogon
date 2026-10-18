@@ -18,6 +18,9 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/objdetect.hpp>
 #include <opencv2/dnn.hpp>
+#include <cstdarg>
+#include <cstdio>
+#include "../common/camera_capture.h"
 
 #include <bcrypt.h>
 
@@ -166,48 +169,19 @@ static void PrintCameraDevices()
     }
 }
 
-static void ConfigureCameraProperties(cv::VideoCapture& cap)
+static void SetupCameraLog(const char* level, const char* format, ...)
 {
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, kCameraWidth);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, kCameraHeight);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    std::printf("[%s] ", level);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stdout, format, args);
+    va_end(args);
+    std::printf("\n");
+    std::fflush(stdout);
 }
 
-static bool OpenCameraBackend(cv::VideoCapture& cap, int cameraIndex, bool allowFallback)
-{
-    std::cout << "Attempting to open camera index " << cameraIndex
-              << " using CAP_DSHOW (allowFallback="
-              << (allowFallback ? "true" : "false") << ")..." << std::endl;
-    cap.open(cameraIndex, cv::CAP_DSHOW);
-    if (!cap.isOpened() && allowFallback)
-    {
-        std::cout << "DirectShow failed, trying Media Foundation (CAP_MSMF)..." << std::endl;
-        cap.open(cameraIndex, cv::CAP_MSMF);
-    }
-    if (!cap.isOpened() && allowFallback)
-    {
-        std::cout << "Media Foundation failed, trying default backend..." << std::endl;
-        cap.open(cameraIndex);
-    }
-    return cap.isOpened();
-}
-
-static bool WarmUpCamera(cv::VideoCapture& cap, int maxAttempts = 30, int delayMs = 100)
-{
-    for (int attempt = 0; attempt < maxAttempts; ++attempt)
-    {
-        if (cap.grab())
-        {
-            return true;
-        }
-        Sleep(delayMs);
-    }
-    return false;
-}
-
-// USB cameras that were idle or in a power-saving state need time to resume before
-// DirectShow/MSMF can enumerate and stream. Retry open/warm-up instead of failing
-// the first verification or enrollment attempt.
+// Uses the same backend selection as FaceLogonHost (common/camera_capture.h),
+// so enrollment and sign-in see the same device, format and image pipeline.
 static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& width, int& height)
 {
     std::wstring friendlyName;
@@ -221,52 +195,23 @@ static bool OpenAndConfigureCamera(cv::VideoCapture& cap, int cameraIndex, int& 
     std::wcout << L"Selected camera: [" << cameraIndex << L"] "
                << friendlyName << std::endl;
 
-    const int MAX_RETRIES = 3;
-    const int RETRY_DELAY_MS = 500;
-
-    for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt)
+    hfl_camera::OpenOptions options;
+    options.maxAttempts = 3;
+    options.retryDelayMs = 500;
+    options.firstFrameTimeoutMs = 5000;
+    wchar_t cachePath[MAX_PATH];
+    if (SUCCEEDED(GetDataDirectory(cachePath)))
     {
-        const bool allowFallback = (attempt >= MAX_RETRIES - 1);
-        std::cout << "Attempting to open camera index " << cameraIndex
-                  << " (attempt " << attempt << "/" << MAX_RETRIES
-                  << ", allowFallback=" << (allowFallback ? "true" : "false") << ")..." << std::endl;
-
-        if (OpenCameraBackend(cap, cameraIndex, allowFallback))
-        {
-            ConfigureCameraProperties(cap);
-
-            width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-            height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-            if (width <= 0 || height <= 0)
-            {
-                width = kCameraWidth;
-                height = kCameraHeight;
-            }
-
-            // On early attempts use fewer warm-up polls so we fail fast and
-            // retry the full open cycle rather than blocking on a camera that
-            // is still re-enumerating after sleep/resume.
-            int warmAttempts = (attempt < MAX_RETRIES) ? 10 : 30;
-            if (WarmUpCamera(cap, warmAttempts))
-            {
-                std::cout << "Camera opened and streaming successfully ("
-                          << width << "x" << height << ")." << std::endl;
-                return true;
-            }
-
-            std::cout << "Camera opened but failed to stream frames after warm-up. Releasing for retry..." << std::endl;
-            cap.release();
-        }
-
-        if (attempt < MAX_RETRIES)
-        {
-            std::cout << "Camera device busy or resuming from power saving. Waiting "
-                      << RETRY_DELAY_MS << " ms before retry..." << std::endl;
-            Sleep(RETRY_DELAY_MS);
-        }
+        PathAppendW(cachePath, L"camera_backend.txt");
+        options.preferenceCachePath = cachePath;
     }
-
-    return false;
+    if (!hfl_camera::OpenCamera(cap, cameraIndex, options, SetupCameraLog, width, height))
+    {
+        return false;
+    }
+    std::cout << "Camera opened and streaming successfully ("
+              << width << "x" << height << ")." << std::endl;
+    return true;
 }
 
 struct HostConfig {
@@ -1041,6 +986,7 @@ int wmain(int argc, wchar_t* argv[])
         std::cout << "{\"protocolVersion\":1,\"isolatedDataDirectory\":true}" << std::endl;
         return 0;
     }
+    hfl_camera::ConfigureOpenCvCameraEnvironment();
     std::wstring sid;
     std::wstring password;
     std::wstring pin;
