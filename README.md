@@ -6,6 +6,14 @@
 
 # English
 
+**Face unlock for Windows 11 using a regular webcam — no Windows Hello IR camera required.**
+
+Turn an ordinary RGB webcam into a convenient face sign-in tool for your own PC.
+
+**[Download the latest release](https://github.com/GoodLight999/HomeFaceLogon/releases/latest)** · Windows 11 x64 · Free and open source (Apache License 2.0)
+
+Face recognition here is a convenience feature, **not** secure Windows Hello biometric authentication; see the limitations below.
+
 A Windows 11 x64 Credential Provider and background host system that enables facial recognition sign-in and unlock using a standard RGB webcam (built with OpenCV YuNet + SFace).
 
 > [!WARNING]
@@ -168,6 +176,14 @@ If the login screen freezes or behaves incorrectly, you can bypass the provider:
 ---
 
 # 日本語
+
+**普通のWebカメラでWindows 11の顔認証ログインを実現。Windows Hello対応の赤外線カメラは不要です。**
+
+一般的なRGB Webカメラを使って、自宅のPCに顔認証によるサインイン・ロック解除機能を追加できます。
+
+**[最新版をダウンロード](https://github.com/GoodLight999/HomeFaceLogon/releases/latest)** · Windows 11 x64 · 無料・オープンソース（Apache License 2.0）
+
+これは利便性のための簡易顔認証であり、Windows Helloと同等の安全な生体認証ではありません。制限事項は以下をご覧ください。
 
 一般的な RGB Web カメラを使用し、OpenCV YuNet + SFace で顔認証による Windows サインインおよびロック解除機能を実現する Credential Provider とバックグラウンドホストのシステムです。
 
