@@ -22,6 +22,7 @@
 // Pipe workers only post messages. All credential/COM state belongs to LogonUI's thread.
 static constexpr UINT WM_HOST_MESSAGE = WM_APP + 1;
 static constexpr UINT WM_RESUME_SCAN = WM_APP + 2;
+static constexpr UINT_PTR RESUME_TIMER = 1;
 
 // Tracks PIN attempts globally across instances to prevent brute force lock bypass by tile toggling
 static int g_nPinAttempts = 0;
@@ -47,11 +48,9 @@ CSampleCredential::CSampleCredential():
     _sessionNonceLo(0),
     _fScanning(false),
     _hMessageWindow(nullptr),
-    _hPowerNotification(nullptr),
+    _resumeTimerId(0),
     _fSelected(false),
-    _fSuspended(false),
     _fResumeScanPending(false),
-    _automaticResumeAt(0),
     _scanGeneration(0)
 {
     DllAddRef();
@@ -189,10 +188,11 @@ HRESULT CSampleCredential::UnAdvise()
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
     _fSelected = true;
+    _CheckResumeClock();
     if (_fFaceAuthSuccess && !_HasCurrentFaceProof()) _ResetAuthentication();
     LogInfo(L"Credential SetSelected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     *pbAutoLogon = _fFaceAuthSuccess ? TRUE : FALSE;
-    if (!_fSuspended && !_fResumeScanPending && !_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
+    if (!_fResumeScanPending && !_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
     return S_OK;
 }
 
@@ -422,6 +422,7 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
     ZeroMemory(pcpcs, sizeof(*pcpcs));
+    if (_CheckResumeClock() || _fResumeScanPending) return S_OK;
     if (_fSubmitting) return S_OK;
     _StopHostProcess();
 
@@ -915,54 +916,34 @@ HRESULT CSampleCredential::_CreateMessageWindow()
     _hMessageWindow = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0,
         HWND_MESSAGE, nullptr, HINST_THISDLL, this);
     if (!_hMessageWindow) return HRESULT_FROM_WIN32(GetLastError());
-    // Message-only windows do not receive broadcasts. Explicit subscription
-    // directs power notifications to this window on the credential's COM thread.
-    _hPowerNotification = RegisterSuspendResumeNotification(_hMessageWindow, DEVICE_NOTIFY_WINDOW_HANDLE);
-    if (!_hPowerNotification)
-        LogError(L"Cannot subscribe to suspend/resume notifications: %lu", GetLastError());
+    _CheckResumeClock();
+    _resumeTimerId = SetTimer(_hMessageWindow, RESUME_TIMER, 500, nullptr);
+    if (!_resumeTimerId) LogError(L"Cannot create resume clock timer: %lu", GetLastError());
     return S_OK;
 }
 
 void CSampleCredential::_DestroyMessageWindow()
 {
-    if (_hPowerNotification) UnregisterSuspendResumeNotification(_hPowerNotification);
-    _hPowerNotification = nullptr;
+    if (_hMessageWindow && _resumeTimerId) KillTimer(_hMessageWindow, _resumeTimerId);
+    _resumeTimerId = 0;
     if (_hMessageWindow) DestroyWindow(_hMessageWindow);
     _hMessageWindow = nullptr;
-    // A discarded subscription may miss the matching resume notification.
-    _fSuspended = false;
     _fResumeScanPending = false;
-    _automaticResumeAt = 0;
     UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
 }
 
-void CSampleCredential::_HandlePowerEvent(WPARAM event)
+bool CSampleCredential::_CheckResumeClock()
 {
-    if (event == PBT_APMSUSPEND)
-    {
-        LogInfo(L"System suspending: discard the old camera session and face proof.");
-        _fSuspended = true;
-        _fResumeScanPending = false;
-        _automaticResumeAt = 0;
-        _StopHostProcess();
-        _ResetAuthentication();
-        return;
-    }
-    if (event != PBT_APMRESUMEAUTOMATIC && event != PBT_APMRESUMESUSPEND) return;
-    _fSuspended = false;
-    // Automatic resume is followed by an interactive resume. Do not restart a
-    // newly opened scan twice; do retry when a background wake has already timed out.
-    if (event == PBT_APMRESUMESUSPEND &&
-        (_fResumeScanPending || (_automaticResumeAt && _fScanning &&
-            GetTickCount64() - _automaticResumeAt < 2000))) return;
-    if (event == PBT_APMRESUMEAUTOMATIC) _automaticResumeAt = GetTickCount64();
+    if (!_resumeClock.Poll()) return false;
+    LogInfo(L"Sleep/resume detected from clock bias: discard old scan and face proof.");
     _StopHostProcess();
     _ResetAuthentication();
-    if (_fSelected && _pCredProvCredentialEvents)
+    if (_fSelected && _hMessageWindow)
     {
-        LogInfo(L"System resumed: queue a fresh camera session (power event=%lu).", static_cast<DWORD>(event));
+        LogInfo(L"System resumed: queue a fresh camera session.");
         _fResumeScanPending = PostMessageW(_hMessageWindow, WM_RESUME_SCAN, _scanGeneration, 0) != FALSE;
     }
+    return true;
 }
 
 LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -975,22 +956,25 @@ LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, 
     }
     if (message == WM_HOST_MESSAGE && credential)
     {
+        // Check before accepting a queued result; WM_TIMER may be delivered later.
+        credential->_CheckResumeClock();
         // Queued results from a stopped/replaced camera session must not sign in.
         if (wParam == credential->_scanGeneration && credential->_fScanning)
             credential->_HandlePipeMessage(static_cast<uint16_t>(lParam));
         return 0;
     }
-    if (message == WM_POWERBROADCAST && credential)
+    if (message == WM_TIMER && wParam == RESUME_TIMER && credential)
     {
-        credential->_HandlePowerEvent(wParam);
-        return TRUE;
+        credential->_CheckResumeClock();
+        return 0;
     }
     if (message == WM_RESUME_SCAN && credential)
     {
+        credential->_CheckResumeClock();
         if (wParam == credential->_scanGeneration)
         {
             credential->_fResumeScanPending = false;
-            if (credential->_fSelected && !credential->_fSuspended && !credential->_fScanning &&
+            if (credential->_fSelected && !credential->_fScanning &&
                 !credential->_fFaceAuthSuccess && !credential->_fSubmitting && credential->_pCredProvCredentialEvents)
                 credential->_StartHostProcess();
         }

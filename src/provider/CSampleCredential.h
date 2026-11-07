@@ -24,6 +24,7 @@
 #include "common.h"
 #include "dll.h"
 #include "resource.h"
+#include "../common/scan_timeout.h"
 
 class CSampleCredential : public ICredentialProviderCredential2, ICredentialProviderCredentialWithFieldOptions
 {
@@ -132,16 +133,15 @@ public:
     uint64_t                                _sessionNonceLo;
     std::atomic<bool>                       _fScanning;
     HWND                                    _hMessageWindow;
-    HPOWERNOTIFY                            _hPowerNotification;
+    UINT_PTR                                _resumeTimerId;
+    hfl_timing::ResumeClock                  _resumeClock;
     bool                                    _fSelected;
-    bool                                    _fSuspended;
     bool                                    _fResumeScanPending;
-    ULONGLONG                               _automaticResumeAt;
     std::atomic<UINT_PTR>                   _scanGeneration;
 
     HRESULT _CreateMessageWindow();
     void _DestroyMessageWindow();
-    void _HandlePowerEvent(WPARAM event);
+    bool _CheckResumeClock();
     static LRESULT CALLBACK _MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     void _ResetAuthentication();
     bool _HasCurrentFaceProof() const;

@@ -21,4 +21,29 @@ private:
     ULONGLONG _started;
     ULONGLONG _budget;
 };
+
+// Detect a real sleep boundary even on desktops where power broadcasts are not
+// delivered. CPU load or a stalled UI increases both clocks and is not a resume.
+class ResumeClock
+{
+public:
+    bool Poll()
+    {
+        const ULONGLONG before = GetTickCount64();
+        ULONGLONG awake = 0;
+        if (!QueryUnbiasedInterruptTime(&awake)) return false;
+        const ULONGLONG after = GetTickCount64();
+        // Do not mistake preemption between clock reads for suspended time.
+        if (after - before > 100) return false;
+        const ULONGLONG awakeMs = awake / 10000ULL;
+        const ULONGLONG bias = after >= awakeMs ? after - awakeMs : 0;
+        const bool resumed = _initialized && bias > _bias && bias - _bias >= 1000;
+        _bias = bias;
+        _initialized = true;
+        return resumed;
+    }
+private:
+    ULONGLONG _bias = 0;
+    bool _initialized = false;
+};
 }

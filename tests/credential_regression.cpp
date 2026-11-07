@@ -57,8 +57,8 @@ static void check(bool value, const char* message) { if (!value) throw std::runt
 class CredentialTestAccess {
 public:
     static HWND powerWindow(CSampleCredential* c) {
-        check(SUCCEEDED(c->_CreateMessageWindow()), "power event window failed");
-        check(c->_hPowerNotification != nullptr, "suspend/resume registration failed");
+        check(SUCCEEDED(c->_CreateMessageWindow()), "resume timer window failed");
+        check(c->_resumeTimerId != 0, "resume timer registration failed");
         return c->_hMessageWindow;
     }
     static void pump(CSampleCredential* c) {
@@ -242,7 +242,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
         auto resumed = CredentialTestAccess::create();
         TestEvents powerEvents;
-        check(SUCCEEDED(resumed->Advise(&powerEvents)), "power event advise failed");
+        check(SUCCEEDED(resumed->Advise(&powerEvents)), "resume timer advise failed");
         BOOL resumeAutoLogon = FALSE;
         resumed->SetSelected(&resumeAutoLogon);
         HWND powerWindow = CredentialTestAccess::powerWindow(resumed);
@@ -250,42 +250,47 @@ int wmain(int argc, wchar_t* argv[]) {
         CredentialTestAccess::queueOldMatch(resumed);
         CredentialTestAccess::match(resumed);
         int resumeLaunches = hostLaunches;
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
-        check(!CredentialTestAccess::scanning(resumed) && !CredentialTestAccess::pending(resumed),
-            "suspend retained a camera session or face proof");
-        resumed->SetSelected(&resumeAutoLogon);
-        check(hostLaunches == resumeLaunches, "selection started a camera while suspended");
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+        // No power messages are sent: the lock desktop did not deliver them.
+        testUptimeMs += 90000;
         CredentialTestAccess::pump(resumed);
         check(hostLaunches == resumeLaunches + 1, "resume did not start exactly one fresh host");
         check(!CredentialTestAccess::pending(resumed), "pre-sleep queued face match was accepted after resume");
         CredentialTestAccess::fakeActiveScan(resumed);
         resumeLaunches = hostLaunches;
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+        testAwakeMs += 5000; testUptimeMs += 5000;
+        SendMessageW(powerWindow, WM_TIMER, RESUME_TIMER, 0);
         CredentialTestAccess::pump(resumed);
         check(hostLaunches == resumeLaunches && CredentialTestAccess::scanning(resumed),
-            "interactive resume stopped the scan just started by automatic resume");
+            "CPU delay was incorrectly detected as sleep");
         // Simulate the camera reaching a terminal no-match result later.
         CredentialTestAccess::finishNoMatch(resumed);
-        // The first new host is stubbed to fail. Interactive resume must retry
-        // a failed/timed-out background scan, even if suspend was not delivered.
+        // A failed or timed-out tile must restart on the next actual sleep.
         resumeLaunches = hostLaunches;
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
+        testUptimeMs += 30000;
+        SendMessageW(powerWindow, WM_TIMER, RESUME_TIMER, 0);
         CredentialTestAccess::pump(resumed);
-        check(hostLaunches == resumeLaunches + 1, "interactive resume did not recover an already failed scan");
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+        check(hostLaunches == resumeLaunches + 1, "resume did not recover an already failed scan");
+        testUptimeMs += 30000;
+        SendMessageW(powerWindow, WM_TIMER, RESUME_TIMER, 0);
         resumed->SetDeselected();
         resumeLaunches = hostLaunches;
         CredentialTestAccess::pump(resumed);
         check(hostLaunches == resumeLaunches, "resume restarted a deselected tile");
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+        testUptimeMs += 30000;
+        SendMessageW(powerWindow, WM_TIMER, RESUME_TIMER, 0);
         CredentialTestAccess::pump(resumed);
         check(hostLaunches == resumeLaunches, "inactive tile opened a camera on resume");
+        resumed->SetSelected(&resumeAutoLogon);
+        CredentialTestAccess::match(resumed);
+        testUptimeMs += 30000;
+        resumeLaunches = hostLaunches;
+        check(serialize(resumed, false) == S_OK, "serialization before timer did not defer stale credentials");
+        CredentialTestAccess::pump(resumed);
+        check(hostLaunches == resumeLaunches + 1 && !CredentialTestAccess::pending(resumed),
+            "serialization cancelled the fresh scan or retained stale proof");
         resumed->UnAdvise();
         check(SUCCEEDED(resumed->Advise(&powerEvents)), "re-advise after resume failed");
         powerWindow = CredentialTestAccess::powerWindow(resumed);
-        SendMessageW(powerWindow, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
         resumed->UnAdvise();
         check(SUCCEEDED(resumed->Advise(&powerEvents)), "replaced subscription advise failed");
         resumeLaunches = hostLaunches;
@@ -293,7 +298,20 @@ int wmain(int argc, wchar_t* argv[]) {
         check(hostLaunches == resumeLaunches + 1, "lost resume notification left replacement tile suspended");
         resumed->UnAdvise();
         resumed->Release();
-        std::cout << "PASS power notifications restart selected scans, discard stale proof and respect deselection\n";
+        std::cout << "PASS resume clock without power messages restarts scans and rejects stale face results\n";
+
+        resumed = CredentialTestAccess::create();
+        check(SUCCEEDED(resumed->Advise(&powerEvents)), "initial callback failed");
+        CredentialTestAccess::queuedMatch(resumed);
+        resumed->UnAdvise();
+        testUptimeMs += 30000;
+        check(SUCCEEDED(resumed->Advise(&powerEvents)), "callback refresh failed");
+        check(!CredentialTestAccess::pending(resumed), "callback refresh forgot sleep and retained face proof");
+        resumed->SetSelected(&resumeAutoLogon);
+        check(!resumeAutoLogon, "refreshed callback auto logged on with pre-sleep proof");
+        resumed->UnAdvise();
+        resumed->Release();
+        std::cout << "PASS sleep detection survives callback refresh without extending face proof\n";
 
         for (auto input : { L"1", L"wrong-pin", L"1234", L"" }) {
             auto c = CredentialTestAccess::create();
