@@ -21,6 +21,7 @@
 
 // Pipe workers only post messages. All credential/COM state belongs to LogonUI's thread.
 static constexpr UINT WM_HOST_MESSAGE = WM_APP + 1;
+static constexpr UINT WM_RESUME_SCAN = WM_APP + 2;
 
 // Tracks PIN attempts globally across instances to prevent brute force lock bypass by tile toggling
 static int g_nPinAttempts = 0;
@@ -46,6 +47,11 @@ CSampleCredential::CSampleCredential():
     _sessionNonceLo(0),
     _fScanning(false),
     _hMessageWindow(nullptr),
+    _hPowerNotification(nullptr),
+    _fSelected(false),
+    _fSuspended(false),
+    _fResumeScanPending(false),
+    _automaticResumeAt(0),
     _scanGeneration(0)
 {
     DllAddRef();
@@ -58,8 +64,7 @@ CSampleCredential::CSampleCredential():
 CSampleCredential::~CSampleCredential()
 {
     _StopHostProcess();
-    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
-    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+    _DestroyMessageWindow();
     if (_pCredProvCredentialEvents) _pCredProvCredentialEvents->Release();
 
     if (_rgFieldStrings[SFI_PASSWORD])
@@ -160,6 +165,8 @@ HRESULT CSampleCredential::UnAdvise()
 {
     LogInfo(L"Credential UnAdvise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
+    _fSelected = false;
+    _fResumeScanPending = false;
     // CredentialsChanged re-enumerates the tile and replaces its event callback
     // before GetCredentialCount/GetSerialization. Releasing that callback must
     // not consume the face proof or cancel an already packaged submission.
@@ -169,9 +176,7 @@ HRESULT CSampleCredential::UnAdvise()
         _pCredProvCredentialEvents->Release();
     }
     _pCredProvCredentialEvents = nullptr;
-    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
-    _hMessageWindow = nullptr;
-    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+    _DestroyMessageWindow();
     return S_OK;
 }
 
@@ -183,10 +188,11 @@ HRESULT CSampleCredential::UnAdvise()
 // selected, you would do it here.
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
+    _fSelected = true;
     if (_fFaceAuthSuccess && !_HasCurrentFaceProof()) _ResetAuthentication();
     LogInfo(L"Credential SetSelected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     *pbAutoLogon = _fFaceAuthSuccess ? TRUE : FALSE;
-    if (!_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
+    if (!_fSuspended && !_fResumeScanPending && !_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
     return S_OK;
 }
 
@@ -195,6 +201,8 @@ HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 // is to clear out the password field.
 HRESULT CSampleCredential::SetDeselected()
 {
+    _fSelected = false;
+    _fResumeScanPending = false;
     LogInfo(L"Credential SetDeselected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
     _ResetAuthentication();
@@ -906,7 +914,55 @@ HRESULT CSampleCredential::_CreateMessageWindow()
         return HRESULT_FROM_WIN32(GetLastError());
     _hMessageWindow = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0,
         HWND_MESSAGE, nullptr, HINST_THISDLL, this);
-    return _hMessageWindow ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    if (!_hMessageWindow) return HRESULT_FROM_WIN32(GetLastError());
+    // Message-only windows do not receive broadcasts. Explicit subscription
+    // directs power notifications to this window on the credential's COM thread.
+    _hPowerNotification = RegisterSuspendResumeNotification(_hMessageWindow, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!_hPowerNotification)
+        LogError(L"Cannot subscribe to suspend/resume notifications: %lu", GetLastError());
+    return S_OK;
+}
+
+void CSampleCredential::_DestroyMessageWindow()
+{
+    if (_hPowerNotification) UnregisterSuspendResumeNotification(_hPowerNotification);
+    _hPowerNotification = nullptr;
+    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
+    _hMessageWindow = nullptr;
+    // A discarded subscription may miss the matching resume notification.
+    _fSuspended = false;
+    _fResumeScanPending = false;
+    _automaticResumeAt = 0;
+    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+}
+
+void CSampleCredential::_HandlePowerEvent(WPARAM event)
+{
+    if (event == PBT_APMSUSPEND)
+    {
+        LogInfo(L"System suspending: discard the old camera session and face proof.");
+        _fSuspended = true;
+        _fResumeScanPending = false;
+        _automaticResumeAt = 0;
+        _StopHostProcess();
+        _ResetAuthentication();
+        return;
+    }
+    if (event != PBT_APMRESUMEAUTOMATIC && event != PBT_APMRESUMESUSPEND) return;
+    _fSuspended = false;
+    // Automatic resume is followed by an interactive resume. Do not restart a
+    // newly opened scan twice; do retry when a background wake has already timed out.
+    if (event == PBT_APMRESUMESUSPEND &&
+        (_fResumeScanPending || (_automaticResumeAt && _fScanning &&
+            GetTickCount64() - _automaticResumeAt < 2000))) return;
+    if (event == PBT_APMRESUMEAUTOMATIC) _automaticResumeAt = GetTickCount64();
+    _StopHostProcess();
+    _ResetAuthentication();
+    if (_fSelected && _pCredProvCredentialEvents)
+    {
+        LogInfo(L"System resumed: queue a fresh camera session (power event=%lu).", static_cast<DWORD>(event));
+        _fResumeScanPending = PostMessageW(_hMessageWindow, WM_RESUME_SCAN, _scanGeneration, 0) != FALSE;
+    }
 }
 
 LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -922,6 +978,22 @@ LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, 
         // Queued results from a stopped/replaced camera session must not sign in.
         if (wParam == credential->_scanGeneration && credential->_fScanning)
             credential->_HandlePipeMessage(static_cast<uint16_t>(lParam));
+        return 0;
+    }
+    if (message == WM_POWERBROADCAST && credential)
+    {
+        credential->_HandlePowerEvent(wParam);
+        return TRUE;
+    }
+    if (message == WM_RESUME_SCAN && credential)
+    {
+        if (wParam == credential->_scanGeneration)
+        {
+            credential->_fResumeScanPending = false;
+            if (credential->_fSelected && !credential->_fSuspended && !credential->_fScanning &&
+                !credential->_fFaceAuthSuccess && !credential->_fSubmitting && credential->_pCredProvCredentialEvents)
+                credential->_StartHostProcess();
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -958,6 +1030,7 @@ HRESULT CSampleCredential::_ClearPin()
 
 void CSampleCredential::_StopHostProcess()
 {
+    _fResumeScanPending = false;
     _fScanning = false;
     ++_scanGeneration;
     if (_hPipeEvent) SetEvent(_hPipeEvent);
