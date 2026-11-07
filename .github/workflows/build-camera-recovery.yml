@@ -90,7 +90,7 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: HomeFaceLogon-v0.3.7-camera-speedup
+          name: HomeFaceLogon-v0.3.8-resume-recovery
           path: installer_output/*.exe
           if-no-files-found: error
           retention-days: 30

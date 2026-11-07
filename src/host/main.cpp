@@ -12,6 +12,7 @@
 #include <ctime>
 #include <cstdarg>
 #include <opencv2/opencv.hpp>
+#include "../common/scan_timeout.h"
 #include "../common/camera_capture.h"
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -741,7 +742,7 @@ int main(int argc, char* argv[])
 
     int framesCount = 0;
     int consecutiveEmptyFrames = 0;
-    ULONGLONG startTime = GetTickCount64();
+    hfl_timing::ScanTimeout scanTimeout(config.scanTimeoutMs);
 
     cv::Mat prevGray;
     cv::Size lastDetectorInputSize;
@@ -758,7 +759,7 @@ int main(int argc, char* argv[])
     while (g_running && cameraOk)
     {
         // Check scanning timeout
-        if (GetTickCount64() - startTime > static_cast<ULONGLONG>(config.scanTimeoutMs))
+        if (scanTimeout.Expired())
         {
             HostLog("INFO", "Scan timeout reached (%d ms). Exiting with no match.", config.scanTimeoutMs);
             SendPipeMessage(MSG_NO_MATCH);

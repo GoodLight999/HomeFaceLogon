@@ -21,6 +21,8 @@
 
 // Pipe workers only post messages. All credential/COM state belongs to LogonUI's thread.
 static constexpr UINT WM_HOST_MESSAGE = WM_APP + 1;
+static constexpr UINT WM_RESUME_SCAN = WM_APP + 2;
+static constexpr UINT_PTR RESUME_TIMER = 1;
 
 // Tracks PIN attempts globally across instances to prevent brute force lock bypass by tile toggling
 static int g_nPinAttempts = 0;
@@ -46,6 +48,9 @@ CSampleCredential::CSampleCredential():
     _sessionNonceLo(0),
     _fScanning(false),
     _hMessageWindow(nullptr),
+    _resumeTimerId(0),
+    _fSelected(false),
+    _fResumeScanPending(false),
     _scanGeneration(0)
 {
     DllAddRef();
@@ -58,8 +63,7 @@ CSampleCredential::CSampleCredential():
 CSampleCredential::~CSampleCredential()
 {
     _StopHostProcess();
-    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
-    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+    _DestroyMessageWindow();
     if (_pCredProvCredentialEvents) _pCredProvCredentialEvents->Release();
 
     if (_rgFieldStrings[SFI_PASSWORD])
@@ -160,6 +164,8 @@ HRESULT CSampleCredential::UnAdvise()
 {
     LogInfo(L"Credential UnAdvise: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
+    _fSelected = false;
+    _fResumeScanPending = false;
     // CredentialsChanged re-enumerates the tile and replaces its event callback
     // before GetCredentialCount/GetSerialization. Releasing that callback must
     // not consume the face proof or cancel an already packaged submission.
@@ -169,9 +175,7 @@ HRESULT CSampleCredential::UnAdvise()
         _pCredProvCredentialEvents->Release();
     }
     _pCredProvCredentialEvents = nullptr;
-    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
-    _hMessageWindow = nullptr;
-    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+    _DestroyMessageWindow();
     return S_OK;
 }
 
@@ -183,10 +187,12 @@ HRESULT CSampleCredential::UnAdvise()
 // selected, you would do it here.
 HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 {
+    _fSelected = true;
+    _CheckResumeClock();
     if (_fFaceAuthSuccess && !_HasCurrentFaceProof()) _ResetAuthentication();
     LogInfo(L"Credential SetSelected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     *pbAutoLogon = _fFaceAuthSuccess ? TRUE : FALSE;
-    if (!_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
+    if (!_fResumeScanPending && !_fFaceAuthSuccess && !_fSubmitting && !_fScanning) _StartHostProcess();
     return S_OK;
 }
 
@@ -195,6 +201,8 @@ HRESULT CSampleCredential::SetSelected(_Out_ BOOL *pbAutoLogon)
 // is to clear out the password field.
 HRESULT CSampleCredential::SetDeselected()
 {
+    _fSelected = false;
+    _fResumeScanPending = false;
     LogInfo(L"Credential SetDeselected: face=%d, submitting=%d", _fFaceAuthSuccess, _fSubmitting);
     _StopHostProcess();
     _ResetAuthentication();
@@ -414,6 +422,7 @@ HRESULT CSampleCredential::GetSerialization(_Out_ CREDENTIAL_PROVIDER_GET_SERIAL
     *ppwszOptionalStatusText = nullptr;
     *pcpsiOptionalStatusIcon = CPSI_NONE;
     ZeroMemory(pcpcs, sizeof(*pcpcs));
+    if (_CheckResumeClock() || _fResumeScanPending) return S_OK;
     if (_fSubmitting) return S_OK;
     _StopHostProcess();
 
@@ -906,7 +915,35 @@ HRESULT CSampleCredential::_CreateMessageWindow()
         return HRESULT_FROM_WIN32(GetLastError());
     _hMessageWindow = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0,
         HWND_MESSAGE, nullptr, HINST_THISDLL, this);
-    return _hMessageWindow ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    if (!_hMessageWindow) return HRESULT_FROM_WIN32(GetLastError());
+    _CheckResumeClock();
+    _resumeTimerId = SetTimer(_hMessageWindow, RESUME_TIMER, 500, nullptr);
+    if (!_resumeTimerId) LogError(L"Cannot create resume clock timer: %lu", GetLastError());
+    return S_OK;
+}
+
+void CSampleCredential::_DestroyMessageWindow()
+{
+    if (_hMessageWindow && _resumeTimerId) KillTimer(_hMessageWindow, _resumeTimerId);
+    _resumeTimerId = 0;
+    if (_hMessageWindow) DestroyWindow(_hMessageWindow);
+    _hMessageWindow = nullptr;
+    _fResumeScanPending = false;
+    UnregisterClassW(L"HomeFaceLogonCredentialEvents", HINST_THISDLL);
+}
+
+bool CSampleCredential::_CheckResumeClock()
+{
+    if (!_resumeClock.Poll()) return false;
+    LogInfo(L"Sleep/resume detected from clock bias: discard old scan and face proof.");
+    _StopHostProcess();
+    _ResetAuthentication();
+    if (_fSelected && _hMessageWindow)
+    {
+        LogInfo(L"System resumed: queue a fresh camera session.");
+        _fResumeScanPending = PostMessageW(_hMessageWindow, WM_RESUME_SCAN, _scanGeneration, 0) != FALSE;
+    }
+    return true;
 }
 
 LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -919,9 +956,28 @@ LRESULT CALLBACK CSampleCredential::_MessageWindowProc(HWND hwnd, UINT message, 
     }
     if (message == WM_HOST_MESSAGE && credential)
     {
+        // Check before accepting a queued result; WM_TIMER may be delivered later.
+        credential->_CheckResumeClock();
         // Queued results from a stopped/replaced camera session must not sign in.
         if (wParam == credential->_scanGeneration && credential->_fScanning)
             credential->_HandlePipeMessage(static_cast<uint16_t>(lParam));
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == RESUME_TIMER && credential)
+    {
+        credential->_CheckResumeClock();
+        return 0;
+    }
+    if (message == WM_RESUME_SCAN && credential)
+    {
+        credential->_CheckResumeClock();
+        if (wParam == credential->_scanGeneration)
+        {
+            credential->_fResumeScanPending = false;
+            if (credential->_fSelected && !credential->_fScanning &&
+                !credential->_fFaceAuthSuccess && !credential->_fSubmitting && credential->_pCredProvCredentialEvents)
+                credential->_StartHostProcess();
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -958,6 +1014,7 @@ HRESULT CSampleCredential::_ClearPin()
 
 void CSampleCredential::_StopHostProcess()
 {
+    _fResumeScanPending = false;
     _fScanning = false;
     ++_scanGeneration;
     if (_hPipeEvent) SetEvent(_hPipeEvent);

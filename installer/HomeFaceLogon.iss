@@ -4,12 +4,12 @@
 
 [Setup]
 AppName=HomeFaceLogon
-AppVersion=0.3.7
+AppVersion=0.3.8
 AppPublisher=HomeFaceLogon Team
 DefaultDirName={commonpf}\HomeFaceLogon
 DefaultGroupName=HomeFaceLogon
 OutputDir=..\installer_output
-OutputBaseFilename=HomeFaceLogonSetup-v0.3.7-camera-speedup
+OutputBaseFilename=HomeFaceLogonSetup-v0.3.8-resume-recovery
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
